@@ -34,8 +34,14 @@ def main(cfg: MainConfig) -> None:
     pil_images = [Image.open(p).convert("RGB") for p in image_paths]
 
     vggt_output_gpu = reconstruction.run(image_paths, pil_images, cfg, device, dtype)
-    feature_paths = feature_extraction.run(pil_images, vggt_output_gpu, cfg, device, output_dir)
-    final_data_cpu = processing.filter_and_aggregate(vggt_output_gpu, feature_paths, cfg.processing)
+
+    if getattr(cfg.processing, "streaming", True):
+        aggregator = processing.StreamingVoxelAggregator(vggt_output_gpu, cfg.processing, device)
+        feature_extraction.run(pil_images, vggt_output_gpu, cfg, device, output_dir, aggregator=aggregator)
+        final_data_cpu = aggregator.finalize()
+    else:
+        feature_paths = feature_extraction.run(pil_images, vggt_output_gpu, cfg, device, output_dir)
+        final_data_cpu = processing.filter_and_aggregate(vggt_output_gpu, feature_paths, cfg.processing)
     processing.save_artifacts(output_dir, final_data_cpu)
 
     import shutil

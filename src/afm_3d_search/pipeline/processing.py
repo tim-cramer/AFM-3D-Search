@@ -68,6 +68,93 @@ def aggregate_points_and_features_numpy(points, colors, features_dict, voxel_siz
         "clip_features": agg_clip,
     }
 
+class StreamingVoxelAggregator:
+    """Voxel-averages features on the fly — no temp files, no full-scene RAM peak.
+
+    The confidence mask, world coordinates, and voxel assignment are derived
+    once from the reconstruction output (on GPU when available); each per-frame
+    feature map is then scatter-added into CPU float32 accumulators via
+    ``index_add_`` the moment the extractor produces it.
+    """
+
+    def __init__(self, vggt_output: dict, proc_cfg: DictConfig, device: str):
+        depth = vggt_output["depth_tensor"].squeeze(0).squeeze(-1).to(device).float()   # (S,H,W)
+        conf = vggt_output["confidence_tensor"].squeeze(0).to(device).float()           # (S,H,W)
+        images = vggt_output["images_tensor"].squeeze(0).to(device).float()             # (S,3,H,W)
+        extr = vggt_output["extrinsic_tensor"].squeeze(0).to(device).float()            # (S,3,4)
+        intr = vggt_output["intrinsic_tensor"].squeeze(0).to(device).float()            # (S,3,3)
+        S, H, W = depth.shape
+
+        if proc_cfg.conf_percentile > 0:
+            flat = conf.reshape(-1)
+            k = min(max(int(len(flat) * proc_cfg.conf_percentile / 100.0), 1), len(flat))
+            threshold = flat.kthvalue(k).values
+            mask = conf >= threshold
+        else:
+            mask = torch.ones_like(conf, dtype=torch.bool)
+        self.mask = mask
+
+        # GPU unprojection (mirrors depth_to_world_coords_points)
+        ys, xs = torch.meshgrid(
+            torch.arange(H, device=device, dtype=torch.float32),
+            torch.arange(W, device=device, dtype=torch.float32), indexing="ij")
+        cam = torch.stack([xs, ys, torch.ones_like(xs)], dim=-1).unsqueeze(0) * depth.unsqueeze(-1)
+        cam = torch.einsum("shwj,skj->shwk", cam, torch.linalg.inv(intr))
+        hom = torch.cat([cam, torch.ones_like(cam[..., :1])], dim=-1)
+        bottom = torch.tensor([0.0, 0.0, 0.0, 1.0], device=device).expand(S, 1, 4)
+        inv_extr = torch.linalg.inv(torch.cat([extr, bottom], dim=1))
+        world = torch.einsum("shwj,skj->shwk", hom, inv_extr)[..., :3]
+
+        points = world[mask]                                                            # (N,3)
+        voxel_idx = torch.floor(points / proc_cfg.voxel_size).long()
+        voxel_idx -= voxel_idx.min(dim=0).values
+        ext = voxel_idx.max(dim=0).values + 1
+        linear = (voxel_idx[:, 0] * ext[1] + voxel_idx[:, 1]) * ext[2] + voxel_idx[:, 2]
+        _, inverse = torch.unique(linear, return_inverse=True)
+        self.num_voxels = int(inverse.max().item()) + 1
+        self.counts = torch.bincount(inverse, minlength=self.num_voxels).float().cpu()
+
+        inverse_cpu = inverse.cpu()
+        per_frame = mask.view(S, -1).sum(dim=1).tolist()
+        self.frame_inverse = list(torch.split(inverse_cpu, per_frame))
+
+        self.pos_sum = torch.zeros(self.num_voxels, 3)
+        self.pos_sum.index_add_(0, inverse_cpu, points.float().cpu())
+        self.col_sum = torch.zeros(self.num_voxels, 3)
+        self.col_sum.index_add_(0, inverse_cpu, images.permute(0, 2, 3, 1)[mask].float().cpu())
+        self.dino_sum = None
+        self.clip_sum = None
+
+        print(f"🧊 Streaming voxel grid ready: {len(points)} points -> {self.num_voxels} voxels "
+              f"(voxel size {proc_cfg.voxel_size})")
+        del depth, conf, images, world, cam, hom, points, inverse
+        if device == "cuda":
+            torch.cuda.empty_cache()
+
+    def _add(self, current_sum, frame_idx: int, feature_map: torch.Tensor):
+        selected = feature_map[self.mask[frame_idx]].float().cpu()
+        if current_sum is None:
+            current_sum = torch.zeros(self.num_voxels, selected.shape[1])
+        current_sum.index_add_(0, self.frame_inverse[frame_idx], selected)
+        return current_sum
+
+    def add_dino(self, frame_idx: int, feature_map: torch.Tensor):
+        """feature_map: (H, W, C) tensor on the extraction device."""
+        self.dino_sum = self._add(self.dino_sum, frame_idx, feature_map)
+
+    def add_clip(self, frame_idx: int, feature_map: torch.Tensor):
+        self.clip_sum = self._add(self.clip_sum, frame_idx, feature_map)
+
+    def finalize(self) -> dict:
+        counts = self.counts.unsqueeze(1)
+        return {
+            "points": (self.pos_sum / counts).numpy(),
+            "colors": (self.col_sum / counts).numpy(),
+            "dino_features": (self.dino_sum / counts).numpy(),
+            "clip_features": (self.clip_sum / counts).numpy(),
+        }
+
+
 def filter_and_aggregate(vggt_output_gpu: dict, feature_paths: dict, proc_cfg: DictConfig) -> dict:
     """
     Moves data to CPU and processes it using NumPy, including voxel aggregation.

@@ -84,7 +84,7 @@ class _MaskEmbeddingFeatureImageGenerator:
 
 
 # --- Main Feature Extraction Functions ---
-def extract_dino_features_from_pil(pil_images, dino_version, target_height, target_width, device, batch_size, output_dir):
+def extract_dino_features_from_pil(pil_images, dino_version, target_height, target_width, device, batch_size, output_dir, sink=None):
 
     print(f"🦖 Initializing DINOv2 model ({dino_version})...")
     dinov2_model = torch.hub.load('facebookresearch/dinov2', dino_version, verbose=False).to(device).eval()
@@ -121,17 +121,21 @@ def extract_dino_features_from_pil(pil_images, dino_version, target_height, targ
             upsampled_features = torch.nn.functional.interpolate(
                 feature_map_2d, size=(target_height, target_width), mode='bilinear', align_corners=False
             )
-            batch_filepath = temp_features_dir / f"batch_{i}.pt"
-            # fp16 halves the on-disk footprint (~300MB/frame at full res otherwise)
-            torch.save(upsampled_features.half().cpu(), batch_filepath)
-            feature_file_paths.append(batch_filepath)
+            if sink is not None:
+                for j in range(upsampled_features.shape[0]):
+                    sink(i + j, upsampled_features[j].permute(1, 2, 0))
+            else:
+                batch_filepath = temp_features_dir / f"batch_{i}.pt"
+                # fp16 halves the on-disk footprint (~300MB/frame at full res otherwise)
+                torch.save(upsampled_features.half().cpu(), batch_filepath)
+                feature_file_paths.append(batch_filepath)
     del dinov2_model
     torch.cuda.empty_cache()
 
     return feature_file_paths 
 
 
-def extract_clip_features_from_pil(pil_images: List[Image.Image], clip_version: str, sam_checkpoint_filename: str, target_height: int, target_width: int, device: str, output_dir: Path) -> List[Path]:
+def extract_clip_features_from_pil(pil_images: List[Image.Image], clip_version: str, sam_checkpoint_filename: str, target_height: int, target_width: int, device: str, output_dir: Path, sink=None) -> List[Path]:
     print("📎 Initializing SAM and CLIP models...")
     
     WEIGHTS_DIR = Path("weights")
@@ -157,16 +161,13 @@ def extract_clip_features_from_pil(pil_images: List[Image.Image], clip_version: 
             resized_image = image.resize((target_width, target_height))
             # Generate the feature tensor for the single image
             feature_tensor = feature_generator.generate_features(np.array(resized_image))
-            
-            # ❌ INSTEAD OF THIS:
-            # all_features.append(feature_tensor)
 
-            # ✅ DO THIS:
-            # Define a unique path for the current image's features
-            image_filepath = temp_features_dir / f"image_{i}.pt"
-            # Move tensor to CPU, save it to disk, and store the path
-            torch.save(feature_tensor.cpu(), image_filepath)
-            feature_file_paths.append(image_filepath)
+            if sink is not None:
+                sink(i, feature_tensor)
+            else:
+                image_filepath = temp_features_dir / f"image_{i}.pt"
+                torch.save(feature_tensor.cpu(), image_filepath)
+                feature_file_paths.append(image_filepath)
 
     del sam_model, mask_generator, clip_encoder, feature_generator
     gc.collect()
@@ -176,15 +177,18 @@ def extract_clip_features_from_pil(pil_images: List[Image.Image], clip_version: 
 
 
 # --- Main Run Function ---
-def run(pil_images: List[Image.Image], vggt_output: Dict, cfg: DictConfig, device: str,  output_dir) -> Dict:
-    """Extracts all configured features and returns them as GPU tensors."""
-    
+def run(pil_images: List[Image.Image], vggt_output: Dict, cfg: DictConfig, device: str,  output_dir, aggregator=None) -> Dict:
+    """Extracts all configured features. With an aggregator, features are
+    voxel-accumulated on the fly instead of being written to temp files."""
+
     dino_paths = extract_dino_features_from_pil(
-        pil_images, cfg.models.dino.version, vggt_output['height'], vggt_output['width'], device, cfg.processing.dino_batch_size, output_dir
+        pil_images, cfg.models.dino.version, vggt_output['height'], vggt_output['width'], device, cfg.processing.dino_batch_size, output_dir,
+        sink=aggregator.add_dino if aggregator is not None else None
     )
-    
+
     clip_paths = extract_clip_features_from_pil(
-        pil_images, cfg.models.clip.version, cfg.models.sam.checkpoint, vggt_output['height'], vggt_output['width'], device, output_dir
+        pil_images, cfg.models.clip.version, cfg.models.sam.checkpoint, vggt_output['height'], vggt_output['width'], device, output_dir,
+        sink=aggregator.add_clip if aggregator is not None else None
     )
 
     gc.collect()

@@ -3,3 +3,4 @@ conf_percentile: 20.0
 voxel_size: 0.01
 dino_batch_size: 2
 clip_batch_size: 1
+streaming: true   # voxel-aggregate features on the fly (no temp files)

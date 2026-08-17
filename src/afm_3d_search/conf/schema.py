@@ -48,6 +48,7 @@ class ProcessingConfig:
     voxel_size: float
     dino_batch_size: int
     clip_batch_size: int
+    streaming: bool = True
 
 @dataclass
 class HighlightConfig:
