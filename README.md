@@ -25,6 +25,8 @@ uv pip install --no-deps "vggt-omega @ git+https://github.com/facebookresearch/v
 
 Or run [`scripts/setup_gpu_instance.sh`](scripts/setup_gpu_instance.sh) on a fresh Ubuntu GPU box.
 
+The VGGT-Ω weights are gated on Hugging Face (Fair Noncommercial Research License): accept the license at [facebook/VGGT-Omega](https://huggingface.co/facebook/VGGT-Omega) and authenticate once with `huggingface-cli login`.
+
 **GPU requirements:** peak memory is the reconstruction forward pass over all frames at once. With VGGT-Ω, ~50 frames fit comfortably in 20 GB (half A100); original VGGT needs roughly 3× that. SAM/CLIP/DINO run sequentially afterwards and fit in 8 GB.
 
 ## Running the pipeline

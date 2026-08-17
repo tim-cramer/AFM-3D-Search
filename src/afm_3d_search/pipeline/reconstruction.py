@@ -6,7 +6,10 @@ import numpy as np
 import gc
 
 VGGT_WEIGHTS_URL = "https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt"
-VGGT_OMEGA_WEIGHTS_URL = "https://huggingface.co/facebook/VGGT-Omega/resolve/main/vggt_omega_1b_512.pt"
+# Gated repo (Fair Noncommercial Research License): accept the license on
+# huggingface.co and authenticate once via `huggingface-cli login`.
+VGGT_OMEGA_REPO = "facebook/VGGT-Omega"
+VGGT_OMEGA_CHECKPOINT = "vggt_omega_1b_512.pt"
 
 
 def run(image_paths: List[str], pil_images: List[Image.Image], cfg, device: str, dtype: torch.dtype) -> Dict:
@@ -37,9 +40,12 @@ def run_vggt_omega(image_paths: List[str], image_resolution: int, device: str, d
     from vggt_omega.utils.load_fn import load_and_preprocess_images
     from vggt_omega.utils.pose_enc import encoding_to_camera
 
+    from huggingface_hub import hf_hub_download
+
     print(f"🔄 Initializing VGGT-Omega on {device}...")
     model = VGGTOmega()
-    state_dict = torch.hub.load_state_dict_from_url(VGGT_OMEGA_WEIGHTS_URL, map_location="cpu")
+    checkpoint_path = hf_hub_download(repo_id=VGGT_OMEGA_REPO, filename=VGGT_OMEGA_CHECKPOINT)
+    state_dict = torch.load(checkpoint_path, map_location="cpu")
     model.load_state_dict(state_dict)
     model.eval().to(device)
     del state_dict

@@ -36,11 +36,13 @@ python -c "from vggt_omega.models import VGGTOmega; print('vggt_omega import OK'
     uv pip install "vggt-omega @ git+https://github.com/facebookresearch/vggt-omega.git"
 }
 
-# 5. Pre-download reconstruction weights (~4.6 GB; SAM/CLIP/DINO download on first pipeline run)
-python - <<'EOF'
-import torch
-url = "https://huggingface.co/facebook/VGGT-Omega/resolve/main/vggt_omega_1b_512.pt"
-torch.hub.load_state_dict_from_url(url, map_location="cpu")
+# 5. Pre-download reconstruction weights (~4.6 GB; SAM/CLIP/DINO download on
+#    first pipeline run). facebook/VGGT-Omega is GATED on Hugging Face: accept
+#    the Fair Noncommercial Research License in the browser, then authenticate
+#    here once with `huggingface-cli login` (or export HF_TOKEN).
+python - <<'EOF' || echo "WARN: VGGT-Omega weights not cached yet — accept the license at https://huggingface.co/facebook/VGGT-Omega and run 'huggingface-cli login', then re-run this script."
+from huggingface_hub import hf_hub_download
+hf_hub_download(repo_id="facebook/VGGT-Omega", filename="vggt_omega_1b_512.pt")
 print("VGGT-Omega weights cached")
 EOF
 
