@@ -1,0 +1,5 @@
+# Web viewer — CPU only, no GPU required
+numpy
+plyfile
+torch>=2.0.0
+openai-clip>=1.0.0
