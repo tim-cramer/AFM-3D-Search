@@ -386,6 +386,7 @@ class Handler(BaseHTTPRequestHandler):
         # similarities are already well separated; these help mushy features only
         contrastive = bool(req.get("contrastive", False))
         smoothing = bool(req.get("smooth", False))
+        use_coverage = bool(req.get("coverage", True))
         if not query:
             self._send(400, b'{"error": "empty query"}')
             return
@@ -401,9 +402,10 @@ class Handler(BaseHTTPRequestHandler):
         # break saturated-sigmoid ties with the raw similarity so top-k stays exact
         sims_span = float(sims.max() - sims.min()) or 1.0
         scores = scores + 0.002 * (sims - sims.min()) / sims_span
-        # partially covered voxels are proportionally less trustworthy
-        scores = scores * index.coverage + (1.0 - index.coverage) * float(scores.min())
-        scores[~index.valid] = float(scores.min()) - 1.0
+        if use_coverage:
+            # partially covered voxels are proportionally less trustworthy
+            scores = scores * index.coverage + (1.0 - index.coverage) * float(scores.min())
+            scores[~index.valid] = float(scores.min()) - 1.0
 
         # exact top-k selection — percentile on a tied plateau overshoots badly
         k = max(1, int(round(len(scores) * (100.0 - percentile) / 100.0)))

@@ -139,6 +139,10 @@
       <label for="greyout">Grey out unmatched points</label>
     </div>
     <div class="ctl-check">
+      <input id="coverage" type="checkbox" checked>
+      <label for="coverage">Coverage filter (A/B)</label>
+    </div>
+    <div class="ctl-check">
       <input id="contrast" type="checkbox">
       <label for="contrast">Contrastive scoring</label>
     </div>
@@ -339,7 +343,7 @@ async function runSearch() {
     const res = await fetch('/api/search', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ query, percentile,
+      body: JSON.stringify({ query, percentile, coverage: $('coverage').checked,
         contrastive: $('contrast').checked, smooth: $('dinosmooth').checked }),
     });
     if (!res.ok) throw new Error((await res.json()).error || res.statusText);
