@@ -85,13 +85,17 @@ class _MaskEmbeddingFeatureImageGenerator:
     def generate_features(self, image_np: np.ndarray):
         masks = self.mask_generator.generate(image_np)
         masks = list(filter(lambda x: x["bbox"][2] * x["bbox"][3] != 0, masks))
-        if not masks: return torch.zeros(image_np.shape[0], image_np.shape[1], self.feat_dim, dtype=torch.half, device=self.device)
 
         with torch.cuda.amp.autocast(enabled=self.device.startswith("cuda")):
             global_feat = self.image_text_encoder.encode_image(image_np)
             global_feat = torch.nn.functional.normalize(global_feat, dim=-1)
 
-        outfeat = torch.zeros(image_np.shape[0], image_np.shape[1], self.feat_dim, dtype=torch.half, device=self.device)
+        H, W = image_np.shape[0], image_np.shape[1]
+        # float32 accumulators: overlapping masks are BLENDED per pixel instead of
+        # overwriting each other (part/whole masks otherwise win arbitrarily and
+        # the same surface ends up with patchy, view-inconsistent features)
+        accum = torch.zeros(H, W, self.feat_dim, dtype=torch.float32, device=self.device)
+        cover = torch.zeros(H, W, dtype=torch.float32, device=self.device)
         feat_per_roi, roi_nonzero_inds, similarity_scores = [], [], []
         mean_color = image_np.reshape(-1, 3).mean(axis=0).astype(image_np.dtype)
 
@@ -112,13 +116,21 @@ class _MaskEmbeddingFeatureImageGenerator:
             roi_nonzero_inds.append(torch.from_numpy(mask["segmentation"]).to(self.device))
             similarity_scores.append(self.cosine_similarity(global_feat, roifeat))
 
-        if not feat_per_roi: return outfeat
+        if feat_per_roi:
+            softmax_scores = torch.nn.functional.softmax(torch.cat(similarity_scores), dim=0)
+            for i, mask_seg in enumerate(roi_nonzero_inds):
+                weighted_feat = torch.nn.functional.normalize(
+                    softmax_scores[i] * global_feat + (1 - softmax_scores[i]) * feat_per_roi[i], dim=-1)
+                accum[mask_seg] += weighted_feat.squeeze(0).float()
+                cover[mask_seg] += 1.0
 
-        softmax_scores = torch.nn.functional.softmax(torch.cat(similarity_scores), dim=0)
-        for i, mask_seg in enumerate(roi_nonzero_inds):
-            weighted_feat = torch.nn.functional.normalize(softmax_scores[i] * global_feat + (1 - softmax_scores[i]) * feat_per_roi[i], dim=-1).half()
-            outfeat[mask_seg] = weighted_feat
-        return outfeat
+        covered = cover > 0
+        if covered.any():
+            accum[covered] = torch.nn.functional.normalize(accum[covered], dim=-1)
+        # pixels no mask ever covered: weak global-image fallback (0.5x) so they
+        # stay searchable instead of being zero-feature holes
+        accum[~covered] = 0.5 * global_feat.squeeze(0).float()
+        return accum.half()
 
 
 # --- Main Feature Extraction Functions ---
@@ -184,7 +196,9 @@ def extract_clip_features_from_pil(pil_images: List[Image.Image], clip_version: 
 
     sam_model = sam_model_registry["vit_h"](checkpoint=sam_checkpoint_path).to(device)
 
-    mask_generator = SamAutomaticMaskGenerator(sam_model)
+    # crop_n_layers=1: extra AMG pass on image crops for small-object coverage;
+    # min_mask_region_area filters speckle masks (needs opencv)
+    mask_generator = SamAutomaticMaskGenerator(sam_model, crop_n_layers=1, min_mask_region_area=100)
     clip_encoder = make_image_encoder(clip_version, device)
     feature_generator = _MaskEmbeddingFeatureImageGenerator(mask_generator, clip_encoder, device)
 

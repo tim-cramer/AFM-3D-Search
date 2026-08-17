@@ -132,18 +132,24 @@ class TextEncoder:
             self._clip = clip
             self.model, _ = clip.load(model_name, device="cpu")
 
+    TEMPLATES = ["a photo of a {}", "a {} in a room", "{}"]
+
     def encode(self, text: str) -> np.ndarray:
+        """Prompt-ensembled embedding: average of normalized template embeddings."""
+        prompts = [t.format(text) for t in self.TEMPLATES]
         with self._torch.no_grad():
             if self.is_siglip:
-                inputs = self.tokenizer([text], padding="max_length", max_length=64,
+                inputs = self.tokenizer(prompts, padding="max_length", max_length=64,
                                         truncation=True, return_tensors="pt")
                 out = self.model.get_text_features(**inputs)
                 if not self._torch.is_tensor(out):  # transformers>=5 returns an output object
                     out = out.pooler_output if getattr(out, "pooler_output", None) is not None else out[0]
-                feat = out.float().numpy()[0]
+                feats = out.float().numpy()
             else:
-                tokens = self._clip.tokenize([text], truncate=True)
-                feat = self.model.encode_text(tokens).float().numpy()[0]
+                tokens = self._clip.tokenize(prompts, truncate=True)
+                feats = self.model.encode_text(tokens).float().numpy()
+        feats /= np.maximum(np.linalg.norm(feats, axis=1, keepdims=True), 1e-8)
+        feat = feats.mean(axis=0)
         return feat / max(np.linalg.norm(feat), 1e-8)
 
 
