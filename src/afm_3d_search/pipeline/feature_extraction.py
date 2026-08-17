@@ -32,11 +32,14 @@ def _download_file(url, destination: Path):
             f.write(chunk)
             bar.update(len(chunk))
 
-# --- Helper Classes for CLIP/SAM Blending ---
+# --- Helper Classes for CLIP/SigLIP + SAM Blending ---
 class _ClipEncoder:
+    """OpenAI CLIP (e.g. 'ViT-L/14')."""
+
     def __init__(self, version, device):
         self.device = device
         self.model, self.preprocess = clip.load(version.replace("_", "/"), device=self.device, jit=False)
+        self.feat_dim = self.model.visual.output_dim
 
     @torch.no_grad()
     def encode_image(self, image: np.ndarray):
@@ -44,13 +47,36 @@ class _ClipEncoder:
         processed_image = self.preprocess(pil_image).unsqueeze(0).to(self.device)
         return self.model.encode_image(processed_image).float()
 
+
+class _SiglipEncoder:
+    """SigLIP/SigLIP2 via HF transformers (e.g. 'google/siglip2-so400m-patch14-384')."""
+
+    def __init__(self, version, device):
+        from transformers import AutoModel, AutoProcessor
+        self.device = device
+        self.model = AutoModel.from_pretrained(version).to(device).eval()
+        self.processor = AutoProcessor.from_pretrained(version)
+        self.feat_dim = self.model.config.vision_config.hidden_size
+
+    @torch.no_grad()
+    def encode_image(self, image: np.ndarray):
+        pil_image = Image.fromarray(image.astype(np.uint8))
+        inputs = self.processor(images=pil_image, return_tensors="pt").to(self.device)
+        return self.model.get_image_features(**inputs).float()
+
+
+def make_image_encoder(version: str, device: str):
+    if "siglip" in version.lower():
+        return _SiglipEncoder(version, device)
+    return _ClipEncoder(version, device)
+
 class _MaskEmbeddingFeatureImageGenerator:
     def __init__(self, mask_generator, image_text_encoder, device):
         self.mask_generator = mask_generator
         self.image_text_encoder = image_text_encoder
         self.cosine_similarity = torch.nn.CosineSimilarity(dim=-1)
         self.device = device
-        self.feat_dim = self.image_text_encoder.model.visual.output_dim
+        self.feat_dim = self.image_text_encoder.feat_dim
 
     @torch.no_grad()
     def generate_features(self, image_np: np.ndarray):
@@ -64,11 +90,20 @@ class _MaskEmbeddingFeatureImageGenerator:
 
         outfeat = torch.zeros(image_np.shape[0], image_np.shape[1], self.feat_dim, dtype=torch.half, device=self.device)
         feat_per_roi, roi_nonzero_inds, similarity_scores = [], [], []
+        mean_color = image_np.reshape(-1, 3).mean(axis=0).astype(image_np.dtype)
 
         for mask in masks:
             _x, _y, _w, _h = map(int, mask["bbox"])
-            img_roi = image_np[_y:_y+_h, _x:_x+_w]
-            if img_roi.size == 0: continue
+            # Mask-exact crop: pad the bbox slightly for context, then neutralize
+            # everything outside SAM's segmentation so the embedding describes
+            # the object, not its rectangular surroundings.
+            pad = max(4, int(0.1 * max(_w, _h)))
+            y0, y1 = max(0, _y - pad), min(image_np.shape[0], _y + _h + pad)
+            x0, x1 = max(0, _x - pad), min(image_np.shape[1], _x + _w + pad)
+            img_roi = image_np[y0:y1, x0:x1].copy()
+            seg_roi = mask["segmentation"][y0:y1, x0:x1]
+            if img_roi.size == 0 or not seg_roi.any(): continue
+            img_roi[~seg_roi] = mean_color
             roifeat = torch.nn.functional.normalize(self.image_text_encoder.encode_image(img_roi), dim=-1)
             feat_per_roi.append(roifeat)
             roi_nonzero_inds.append(torch.from_numpy(mask["segmentation"]).to(self.device))
@@ -147,7 +182,7 @@ def extract_clip_features_from_pil(pil_images: List[Image.Image], clip_version: 
     sam_model = sam_model_registry["vit_h"](checkpoint=sam_checkpoint_path).to(device)
 
     mask_generator = SamAutomaticMaskGenerator(sam_model)
-    clip_encoder = _ClipEncoder(version=clip_version, device=device)
+    clip_encoder = make_image_encoder(clip_version, device)
     feature_generator = _MaskEmbeddingFeatureImageGenerator(mask_generator, clip_encoder, device)
 
     # --- Create a temporary directory for CLIP feature batches ---

@@ -4,7 +4,8 @@ recon:
   backbone: "vggt_omega"   # "vggt_omega" | "vggt"
   image_resolution: 512    # vggt_omega preprocessing resolution
 clip:
-  version: "ViT-L/14"
+  # image-text encoder: SigLIP2 (default) or OpenAI CLIP (e.g. "ViT-L/14")
+  version: "google/siglip2-so400m-patch14-384"
 sam:
   checkpoint: "sam_vit_h_4b8939.pth"
 dino:

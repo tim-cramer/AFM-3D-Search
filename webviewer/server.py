@@ -103,21 +103,112 @@ def _load_ply(path: Path):
 # CLIP text encoder (auto-detects model from feature dim, CPU is fine)
 # --------------------------------------------------------------------------- #
 class TextEncoder:
-    def __init__(self, feature_dim: int):
-        import clip  # noqa: PLC0415
+    """Text side of the pipeline's image-text encoder.
+
+    Model is taken from the scene's encoder.json when present, else guessed
+    from the feature dimension. Supports OpenAI CLIP and SigLIP/SigLIP2.
+    """
+
+    def __init__(self, feature_dim: int, model_name: str = None):
         import torch  # noqa: PLC0415
 
-        self._clip, self._torch = clip, torch
-        version = {512: "ViT-B/32", 768: "ViT-L/14"}.get(feature_dim, "ViT-B/32")
-        print(f"Loading CLIP {version} for {feature_dim}-d features (cpu)...")
-        self.model, _ = clip.load(version, device="cpu")
-        self.version = version
+        self._torch = torch
+        if model_name is None:
+            model_name = {512: "ViT-B/32", 768: "ViT-L/14",
+                          1152: "google/siglip2-so400m-patch14-384"}.get(feature_dim, "ViT-B/32")
+        self.version = model_name
+        self.is_siglip = "siglip" in model_name.lower()
+        # contrastive-softmax temperature; SigLIP cosine gaps are tighter
+        self.temperature = 50.0 if self.is_siglip else 10.0
+
+        print(f"Loading text encoder {model_name} for {feature_dim}-d features (cpu)...")
+        if self.is_siglip:
+            from transformers import AutoModel, AutoTokenizer  # noqa: PLC0415
+            self.model = AutoModel.from_pretrained(model_name).eval()
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        else:
+            import clip  # noqa: PLC0415
+            self._clip = clip
+            self.model, _ = clip.load(model_name, device="cpu")
 
     def encode(self, text: str) -> np.ndarray:
-        tokens = self._clip.tokenize([text], truncate=True)
         with self._torch.no_grad():
-            feat = self.model.encode_text(tokens).float().numpy()[0]
+            if self.is_siglip:
+                inputs = self.tokenizer([text], padding="max_length", max_length=64,
+                                        truncation=True, return_tensors="pt")
+                feat = self.model.get_text_features(**inputs).float().numpy()[0]
+            else:
+                tokens = self._clip.tokenize([text], truncate=True)
+                feat = self.model.encode_text(tokens).float().numpy()[0]
         return feat / max(np.linalg.norm(feat), 1e-8)
+
+
+# --------------------------------------------------------------------------- #
+# Search index: contrastive negatives + DINO-weighted kNN smoothing
+# --------------------------------------------------------------------------- #
+NEGATIVE_PROMPTS = ["object", "things", "stuff", "texture"]
+
+
+class SearchIndex:
+    """Precomputed structures that sharpen raw CLIP similarity:
+
+    - canonical negative embeddings for LERF-style pairwise-softmax relevancy
+    - a 3D kNN graph with DINO-similarity edge weights for structural smoothing
+    """
+
+    def __init__(self, scene, encoder):
+        self.negatives = np.stack([encoder.encode(p) for p in NEGATIVE_PROMPTS])
+        self.temperature = encoder.temperature
+        self.nbr_idx = None
+        self.nbr_w = None
+        self.nbr_w_sum = None
+        if scene["dino"] is None:
+            return
+        try:
+            from scipy.spatial import cKDTree  # noqa: PLC0415
+        except ImportError:
+            print("scipy not available — DINO smoothing disabled")
+            return
+
+        print("Building 3D kNN graph...")
+        points = scene["points"]
+        tree = cKDTree(points)
+        _, idx = tree.query(points, k=9, workers=-1)
+        idx = idx[:, 1:].astype(np.int32)  # drop self-neighbor
+
+        print("Computing DINO edge weights...")
+        dino = scene["dino"].astype(np.float32)
+        dino /= np.maximum(np.linalg.norm(dino, axis=1, keepdims=True), 1e-8)
+        w = np.empty(idx.shape, dtype=np.float32)
+        chunk = 100_000
+        for s in range(0, len(dino), chunk):
+            e = min(s + chunk, len(dino))
+            w[s:e] = np.clip(np.einsum("nd,nkd->nk", dino[s:e], dino[idx[s:e]]), 0.0, 1.0)
+        del dino
+        self.nbr_idx, self.nbr_w, self.nbr_w_sum = idx, w, w.sum(axis=1)
+        print(f"Search index ready ({len(idx)} points, k=8)")
+
+    def relevancy(self, sims_query, clip_feats):
+        """Pairwise softmax vs each negative prompt, take the minimum (LERF)."""
+        result = None
+        for neg in self.negatives:
+            sims_neg = clip_feats @ neg
+            p = 1.0 / (1.0 + np.exp(np.clip((sims_neg - sims_query) * self.temperature, -50, 50)))
+            result = p if result is None else np.minimum(result, p)
+        return result
+
+    def smooth(self, scores):
+        if self.nbr_idx is None:
+            return scores
+        neighbor_avg = (self.nbr_w * scores[self.nbr_idx]).sum(axis=1)
+        return (scores + neighbor_avg) / (1.0 + self.nbr_w_sum)
+
+    def coherence_mask(self, matched):
+        """Keep matches with at least 2 matching neighbors (kills stray points)."""
+        if self.nbr_idx is None:
+            return matched
+        support = matched[self.nbr_idx].sum(axis=1)
+        return matched & (support >= 2)
 
 
 # --------------------------------------------------------------------------- #
@@ -126,6 +217,7 @@ class TextEncoder:
 class Handler(BaseHTTPRequestHandler):
     scene = None
     encoder = None
+    index = None
     encoder_lock = threading.Lock()
     meta = {}
 
@@ -176,20 +268,33 @@ class Handler(BaseHTTPRequestHandler):
             self._send(400, b'{"error": "empty query"}')
             return
 
+        contrastive = bool(req.get("contrastive", True))
+        smoothing = bool(req.get("smooth", True))
+
         with self.encoder_lock:
             text_feat = self.encoder.encode(query)
         sims = self.scene["clip"] @ text_feat
 
-        threshold = float(np.percentile(sims, percentile))
-        matches = int((sims >= threshold).sum())
+        scores = self.index.relevancy(sims, self.scene["clip"]) if contrastive else sims
+        if smoothing:
+            scores = self.index.smooth(scores)
+
+        threshold = float(np.percentile(scores, percentile))
+        matched = scores >= threshold
+        kept = self.index.coherence_mask(matched)
+        scores = scores.astype(np.float32)
+        scores[matched & ~kept] = threshold - 1e-4  # drop stray hits below threshold
+        matches = int(kept.sum())
+
         headers = {
             "X-Threshold": f"{threshold:.6f}",
             "X-Matches": str(matches),
-            "X-Sim-Min": f"{float(sims.min()):.6f}",
-            "X-Sim-Max": f"{float(sims.max()):.6f}",
+            "X-Sim-Min": f"{float(scores.min()):.6f}",
+            "X-Sim-Max": f"{float(scores.max()):.6f}",
         }
-        print(f"  query='{query}' p{percentile:g} thr={threshold:.4f} matches={matches}")
-        self._send(200, sims.astype(np.float32).tobytes(), "application/octet-stream", headers)
+        print(f"  query='{query}' p{percentile:g} contrastive={contrastive} smooth={smoothing} "
+              f"thr={threshold:.4f} matches={matches}")
+        self._send(200, scores.tobytes(), "application/octet-stream", headers)
 
 
 def main():
@@ -203,7 +308,12 @@ def main():
     print(f"Loaded scene '{args.scene_dir.name}': {len(scene['points']):,} points, "
           f"CLIP dim {scene['clip'].shape[1]}, DINO {'yes' if scene['dino'] is not None else 'no'}")
 
-    encoder = TextEncoder(scene["clip"].shape[1])
+    encoder_info = args.scene_dir / "encoder.json"
+    model_name = None
+    if encoder_info.exists():
+        model_name = json.loads(encoder_info.read_text()).get("clip_model")
+    encoder = TextEncoder(scene["clip"].shape[1], model_name)
+    index = SearchIndex(scene, encoder)
 
     suggestions = []
     sf = args.scene_dir / "suggestions.json"
@@ -212,6 +322,7 @@ def main():
 
     Handler.scene = scene
     Handler.encoder = encoder
+    Handler.index = index
     Handler.meta = {
         "scene": args.scene_dir.name,
         "num_points": len(scene["points"]),

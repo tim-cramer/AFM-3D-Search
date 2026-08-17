@@ -91,7 +91,7 @@
 {
   "imports": {
     "three": "/static/vendor/three.module.min.js",
-    "three/addons/controls/OrbitControls.js": "/static/vendor/OrbitControls.js"
+    "three/addons/controls/ArcballControls.js": "/static/vendor/ArcballControls.js"
   }
 }
 </script>
@@ -126,20 +126,28 @@
       <label for="greyout">Grey out unmatched points</label>
     </div>
     <div class="ctl-check">
-      <input id="zup" type="checkbox">
-      <label for="zup">Z-up data</label>
+      <input id="contrast" type="checkbox" checked>
+      <label for="contrast">Contrastive scoring</label>
+    </div>
+    <div class="ctl-check">
+      <input id="dinosmooth" type="checkbox" checked>
+      <label for="dinosmooth">DINO smoothing</label>
+    </div>
+    <div class="ctl-check">
+      <input id="flip" type="checkbox">
+      <label for="flip">Flip scene (180°)</label>
     </div>
   </details>
 
   <button id="clear-btn">Clear highlights</button>
 </div>
 
-<div id="hint">drag&nbsp;·&nbsp;orbit &nbsp;|&nbsp; scroll&nbsp;·&nbsp;zoom &nbsp;|&nbsp; right-drag&nbsp;·&nbsp;pan</div>
+<div id="hint">drag&nbsp;·&nbsp;rotate &nbsp;|&nbsp; ring&nbsp;·&nbsp;axis rotate &nbsp;|&nbsp; scroll&nbsp;·&nbsp;zoom &nbsp;|&nbsp; right-drag&nbsp;·&nbsp;pan</div>
 <div id="loading"><div class="spinner"></div><div id="loading-text">loading point cloud…</div></div>
 
 <script type="module">
 import * as THREE from 'three';
-import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { ArcballControls } from 'three/addons/controls/ArcballControls.js';
 
 const $ = id => document.getElementById(id);
 
@@ -152,9 +160,11 @@ $('canvas-wrap').appendChild(renderer.domElement);
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x0b0e14);
 const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.01, 500);
-const controls = new OrbitControls(camera, renderer.domElement);
-controls.enableDamping = true;
-controls.dampingFactor = 0.08;
+// MeshLab-style arcball: three draggable axis rings + free rotation between them
+const controls = new ArcballControls(camera, renderer.domElement, scene);
+controls.setGizmosVisible(true);
+controls.enableAnimations = true;
+controls.radiusFactor = 0.75;
 
 const group = new THREE.Group();   // holds both clouds; rotated for z-up data
 scene.add(group);
@@ -165,10 +175,30 @@ addEventListener('resize', () => {
   renderer.setSize(innerWidth, innerHeight);
 });
 
+// Corner axes indicator (red X, green Y, blue Z)
+const gizmoScene = new THREE.Scene();
+gizmoScene.add(new THREE.AxesHelper(1.1));
+const gizmoCam = new THREE.PerspectiveCamera(45, 1, 0.1, 10);
+const gizmoDir = new THREE.Vector3();
+
+renderer.autoClear = false;
 (function animate() {
   requestAnimationFrame(animate);
-  controls.update();
+  renderer.setViewport(0, 0, innerWidth, innerHeight);
+  renderer.setScissorTest(false);
+  renderer.clear();
   renderer.render(scene, camera);
+
+  const s = Math.round(Math.min(innerWidth, innerHeight) * 0.14);
+  renderer.clearDepth();
+  renderer.setViewport(innerWidth - s - 10, 10, s, s);
+  renderer.setScissor(innerWidth - s - 10, 10, s, s);
+  renderer.setScissorTest(true);
+  gizmoDir.copy(camera.position).sub(controls.target).normalize();
+  gizmoCam.position.copy(gizmoDir).multiplyScalar(3.2);
+  gizmoCam.up.copy(camera.up);
+  gizmoCam.lookAt(0, 0, 0);
+  renderer.render(gizmoScene, gizmoCam);
 })();
 
 // ---------------------------------------------------------------- state
@@ -206,13 +236,21 @@ async function loadCloud() {
     greyColors[3*i] = greyColors[3*i+1] = greyColors[3*i+2] = v;
   }
 
-  // center + frame
-  const box = new THREE.Box3();
-  const p = new THREE.Vector3();
-  for (let i = 0; i < N; i += 97) box.expandByPoint(p.set(positions[3*i], positions[3*i+1], positions[3*i+2]));
-  const center = box.getCenter(new THREE.Vector3());
-  const diag = box.getSize(new THREE.Vector3()).length();
+  // Robust framing: percentile bounds so stray far-away outlier points
+  // (common in feed-forward recon output) don't blow up center and scale
+  const stride = Math.max(1, Math.floor(N / 60000));
+  const sx = [], sy = [], sz = [];
+  for (let i = 0; i < N; i += stride) { sx.push(positions[3*i]); sy.push(positions[3*i+1]); sz.push(positions[3*i+2]); }
+  const bounds = arr => { arr.sort((a, b) => a - b);
+    return [arr[Math.floor(arr.length * 0.02)], arr[Math.ceil(arr.length * 0.98) - 1]]; };
+  const [x0, x1] = bounds(sx), [y0, y1] = bounds(sy), [z0, z1] = bounds(sz);
+  const center = new THREE.Vector3((x0 + x1) / 2, (y0 + y1) / 2, (z0 + z1) / 2);
+  const diag = Math.hypot(x1 - x0, y1 - y0, z1 - z0);
   baseSize = diag * 0.0028;
+  camera.near = diag * 0.002;
+  camera.far = diag * 200;
+  camera.updateProjectionMatrix();
+  controls.maxDistance = diag * 12;
 
   const geo = new THREE.BufferGeometry();
   geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
@@ -249,7 +287,8 @@ async function runSearch() {
     const res = await fetch('/api/search', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ query, percentile }),
+      body: JSON.stringify({ query, percentile,
+        contrastive: $('contrast').checked, smooth: $('dinosmooth').checked }),
     });
     if (!res.ok) throw new Error((await res.json()).error || res.statusText);
 
@@ -341,7 +380,10 @@ $('size').oninput = () => {
   if (highlightPoints) highlightPoints.material.size = baseSize * 2.2 * k;
 };
 $('greyout').onchange = () => { if (lastSims) applyHighlights(); else clearHighlights(); };
-$('zup').onchange = () => { group.rotation.x = $('zup').checked ? -Math.PI / 2 : 0; };
+$('contrast').onchange = $('dinosmooth').onchange = () => {
+  if (lastQuery) { $('query').value = lastQuery; runSearch(); }
+};
+$('flip').onchange = () => { group.rotation.x = $('flip').checked ? Math.PI : 0; };
 $('size').oninput();
 
 loadCloud().catch(e => {

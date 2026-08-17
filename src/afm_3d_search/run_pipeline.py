@@ -44,6 +44,9 @@ def main(cfg: MainConfig) -> None:
         final_data_cpu = processing.filter_and_aggregate(vggt_output_gpu, feature_paths, cfg.processing)
     processing.save_artifacts(output_dir, final_data_cpu)
 
+    import json
+    (output_dir / "encoder.json").write_text(json.dumps({"clip_model": cfg.models.clip.version}))
+
     import shutil
     shutil.rmtree(output_dir / "temp_dino_features", ignore_errors=True)
     shutil.rmtree(output_dir / "temp_clip_features", ignore_errors=True)
