@@ -92,8 +92,13 @@ def extract_dino_features_from_pil(pil_images, dino_version, target_height, targ
     temp_features_dir = output_dir / "temp_dino_features"
     temp_features_dir.mkdir(parents=True, exist_ok=True)
 
+    # DINOv2 requires dims divisible by its patch size (14); the recon backbone
+    # may produce e.g. 16-divisible dims. Run DINO on the nearest 14-divisible
+    # size, then interpolate features back to the target grid below.
+    dino_height = max(14, round(target_height / 14) * 14)
+    dino_width = max(14, round(target_width / 14) * 14)
     dino_transforms = transforms.Compose([
-        transforms.Resize((target_height, target_width)),
+        transforms.Resize((dino_height, dino_width)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
@@ -109,8 +114,8 @@ def extract_dino_features_from_pil(pil_images, dino_version, target_height, targ
             patch_features = features_dict['x_norm_patchtokens']
 
             B, N, D = patch_features.shape
-            H_patch = target_height // 14
-            W_patch = target_width // 14
+            H_patch = dino_height // 14
+            W_patch = dino_width // 14
 
             feature_map_2d = patch_features.reshape(B, H_patch, W_patch, D).permute(0, 3, 1, 2)
             upsampled_features = torch.nn.functional.interpolate(
