@@ -37,6 +37,10 @@ def main(cfg: MainConfig) -> None:
     feature_paths = feature_extraction.run(pil_images, vggt_output_gpu, cfg, device, output_dir)
     final_data_cpu = processing.filter_and_aggregate(vggt_output_gpu, feature_paths, cfg.processing)
     processing.save_artifacts(output_dir, final_data_cpu)
+
+    import shutil
+    shutil.rmtree(output_dir / "temp_dino_features", ignore_errors=True)
+    shutil.rmtree(output_dir / "temp_clip_features", ignore_errors=True)
     
     print(f"--- ✅ Successfully Processed Scene: {cfg.scene_id} ---")
 

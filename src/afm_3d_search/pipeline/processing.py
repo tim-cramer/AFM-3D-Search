@@ -90,10 +90,12 @@ def filter_and_aggregate(vggt_output_gpu: dict, feature_paths: dict, proc_cfg: D
      # --- Load and Correct Feature Shapes ---
     print("🚚 Loading feature batches from disk...")
     dino_batches = [torch.load(p) for p in tqdm(feature_paths['dino_paths'], desc="Loading DINO")]
-    clip_batches = [torch.load(p) for p in tqdm(feature_paths['clip_paths'], desc="Loading CLIP")]
-    
     dino_features_np = torch.cat(dino_batches, dim=0).numpy()
+    del dino_batches  # tens of GB — free before loading CLIP
+
+    clip_batches = [torch.load(p) for p in tqdm(feature_paths['clip_paths'], desc="Loading CLIP")]
     clip_features_np = torch.cat(clip_batches, dim=0).numpy()
+    del clip_batches
 
     # ✅ FIX 1: Transpose DINO from (N, C, H, W) to (N, H, W, C)
     # The new order is (0, 2, 3, 1) corresponding to the original indices
@@ -117,6 +119,7 @@ def filter_and_aggregate(vggt_output_gpu: dict, feature_paths: dict, proc_cfg: D
     # Now this reshape will work correctly
     dino_features_flat = dino_features_np.reshape(-1, dino_features_np.shape[-1])
     clip_features_flat = clip_features_np.reshape(-1, clip_features_np.shape[-1])
+    del dino_features_np, clip_features_np
     
     
     

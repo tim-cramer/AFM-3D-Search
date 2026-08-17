@@ -122,7 +122,8 @@ def extract_dino_features_from_pil(pil_images, dino_version, target_height, targ
                 feature_map_2d, size=(target_height, target_width), mode='bilinear', align_corners=False
             )
             batch_filepath = temp_features_dir / f"batch_{i}.pt"
-            torch.save(upsampled_features.cpu(), batch_filepath) # Move to CPU and save
+            # fp16 halves the on-disk footprint (~300MB/frame at full res otherwise)
+            torch.save(upsampled_features.half().cpu(), batch_filepath)
             feature_file_paths.append(batch_filepath)
     del dinov2_model
     torch.cuda.empty_cache()
