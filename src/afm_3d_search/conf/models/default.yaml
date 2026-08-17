@@ -1,5 +1,8 @@
 # conf/models/default.yaml
 
+recon:
+  backbone: "vggt_omega"   # "vggt_omega" | "vggt"
+  image_resolution: 512    # vggt_omega preprocessing resolution
 clip:
   version: "ViT-L/14"
 sam:

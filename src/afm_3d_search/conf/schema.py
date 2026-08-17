@@ -17,10 +17,16 @@ class DinoModelConfig:
     version: str
 
 @dataclass
+class ReconModelConfig:
+    backbone: str = "vggt_omega"
+    image_resolution: int = 512
+
+@dataclass
 class ModelsConfig:
     clip: ClipModelConfig
     sam: SamModelConfig
     dino: DinoModelConfig
+    recon: ReconModelConfig = field(default_factory=ReconModelConfig)
 
 @dataclass
 class PathsConfig:
