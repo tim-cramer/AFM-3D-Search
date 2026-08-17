@@ -28,7 +28,14 @@
   }
   h1 { font-size: 17px; font-weight: 650; letter-spacing: 0.2px; }
   h1 span { color: var(--accent); }
-  #scene-info { font-size: 12px; color: var(--muted); margin: 6px 0 14px; line-height: 1.5; }
+  #scene-select {
+    width: 100%; margin-top: 10px; padding: 8px 10px; font-size: 13px; color: var(--text);
+    background: rgba(255,255,255,0.06); border: 1px solid var(--border); border-radius: 8px;
+    outline: none; cursor: pointer;
+  }
+  #scene-select:focus { border-color: var(--accent); }
+  #scene-select option { background: #141a26; }
+  #scene-info { font-size: 12px; color: var(--muted); margin: 8px 0 14px; line-height: 1.5; }
 
   #search-row { display: flex; gap: 8px; }
   #query {
@@ -106,6 +113,7 @@
 
 <div id="panel">
   <h1>AFM <span>3D Search</span></h1>
+  <select id="scene-select"></select>
   <div id="scene-info">loading scene…</div>
 
   <div id="search-row">
@@ -214,12 +222,35 @@ let baseSize = 0.01;
 let lastQuery = null, lastSims = null, lastThreshold = 0;
 
 // ---------------------------------------------------------------- load cloud
-async function loadCloud() {
-  const meta = await (await fetch('/api/meta')).json();
-  $('scene-info').innerHTML =
-    `scene <b>${meta.scene}</b> · ${meta.num_points.toLocaleString()} points · ` +
-    `CLIP ${meta.clip_model} · DINO ${meta.has_dino ? 'yes' : 'no'}`;
+function showLoading(text) {
+  $('loading-text').textContent = text;
+  $('loading').style.display = 'flex';
+  $('loading').style.opacity = 1;
+}
+function hideLoading() {
+  $('loading').style.opacity = 0;
+  setTimeout(() => { $('loading').style.display = 'none'; }, 450);
+}
 
+async function loadCloud() {
+  showLoading('loading scene…');
+  clearHighlights();
+  if (basePoints) { group.remove(basePoints); basePoints.geometry.dispose(); basePoints = null; }
+
+  const meta = await (await fetch('/api/meta')).json();
+  const sel = $('scene-select');
+  sel.innerHTML = '';
+  for (const name of meta.scenes || [meta.scene]) {
+    const o = document.createElement('option');
+    o.value = o.textContent = name;
+    sel.appendChild(o);
+  }
+  sel.value = meta.scene;
+  $('scene-info').innerHTML =
+    `${meta.num_points.toLocaleString()} points · ` +
+    `${meta.clip_model} · DINO ${meta.has_dino ? 'yes' : 'no'}`;
+
+  $('suggestions').innerHTML = '';
   for (const s of meta.suggestions || []) {
     const c = document.createElement('span');
     c.className = 'chip';
@@ -269,10 +300,25 @@ async function loadCloud() {
   controls.target.set(0, 0, 0);
   controls.update();
 
-  $('loading').style.opacity = 0;
-  setTimeout(() => $('loading').remove(), 450);
+  hideLoading();
   $('query').focus();
 }
+
+$('scene-select').onchange = async () => {
+  const name = $('scene-select').value;
+  showLoading(`switching to ${name}… (first load builds the search index)`);
+  try {
+    const res = await fetch('/api/scene', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name }),
+    });
+    if (!res.ok) throw new Error((await res.json()).error || res.statusText);
+    await loadCloud();
+  } catch (e) {
+    $('loading-text').textContent = 'scene switch failed: ' + e.message;
+  }
+};
 
 // ---------------------------------------------------------------- search
 function heatColor(t) { // 0 → amber, 1 → hot red

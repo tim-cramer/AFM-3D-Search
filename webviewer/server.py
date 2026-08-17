@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """AFM 3D Search — browser-based interactive text-search viewer.
 
-Serves a three.js point-cloud viewer with a live query box. Text queries are
-CLIP-encoded on CPU and matched against the featurized point cloud, so the
-whole thing runs without a GPU.
+Serves a three.js point-cloud viewer with a live query box and a scene
+switcher. Text queries are encoded on CPU (OpenAI CLIP or SigLIP2, chosen
+per scene via encoder.json) and matched against the featurized point
+cloud — no GPU required.
 
 Usage (from repo root, inside .rerun_env):
     python webviewer/server.py data/completed/<scene> [--port 8090]
 
-Accepts either pipeline output (point_cloud.ply + clip_features.npy
-[+ dino_features.npy]) or legacy featurized .pt files.
+All sibling directories of <scene> that contain scene data appear in the
+dashboard's scene dropdown. Accepts pipeline output (point_cloud.ply +
+clip_features.npy [+ dino_features.npy]) or legacy featurized .pt files.
 """
 import argparse
 import io
@@ -35,6 +37,10 @@ MIME = {
 # --------------------------------------------------------------------------- #
 # Data loading
 # --------------------------------------------------------------------------- #
+def has_scene_data(path: Path) -> bool:
+    return path.is_dir() and ((path / "point_cloud.ply").exists() or any(path.glob("*.pt")))
+
+
 def load_scene(scene_dir: Path, max_points: int):
     """Load points, colors, and features from a scene directory."""
     pt_files = sorted(scene_dir.glob("*.pt"))
@@ -54,9 +60,7 @@ def load_scene(scene_dir: Path, max_points: int):
         clip_feats = to_np(data["features_clip"])
         dino_feats = to_np(data["features_dino"]) if data.get("features_dino") is not None else None
     else:
-        raise FileNotFoundError(
-            f"No point_cloud.ply or *.pt found in {scene_dir}"
-        )
+        raise FileNotFoundError(f"No point_cloud.ply or *.pt found in {scene_dir}")
 
     if rgb.max() > 1.0:
         rgb = rgb / 255.0
@@ -82,6 +86,7 @@ def load_scene(scene_dir: Path, max_points: int):
         "rgb": (rgb * 255).clip(0, 255).astype(np.uint8),
         "clip": clip_feats,
         "dino": dino_feats,
+        "raw_norms": norms[:, 0],
     }
 
 
@@ -100,14 +105,10 @@ def _load_ply(path: Path):
 
 
 # --------------------------------------------------------------------------- #
-# CLIP text encoder (auto-detects model from feature dim, CPU is fine)
+# Text encoder (OpenAI CLIP or SigLIP/SigLIP2, chosen per scene)
 # --------------------------------------------------------------------------- #
 class TextEncoder:
-    """Text side of the pipeline's image-text encoder.
-
-    Model is taken from the scene's encoder.json when present, else guessed
-    from the feature dimension. Supports OpenAI CLIP and SigLIP/SigLIP2.
-    """
+    TEMPLATES = ["a photo of a {}", "a {} in a room", "{}"]
 
     def __init__(self, feature_dim: int, model_name: str = None):
         import torch  # noqa: PLC0415
@@ -122,7 +123,7 @@ class TextEncoder:
         # CLIP's, but too steep saturates scores into massive ties at 0/0.5/1
         self.temperature = 20.0 if self.is_siglip else 10.0
 
-        print(f"Loading text encoder {model_name} for {feature_dim}-d features (cpu)...")
+        print(f"Loading text encoder {model_name} (cpu)...")
         if self.is_siglip:
             from transformers import AutoModel, AutoTokenizer  # noqa: PLC0415
             self.model = AutoModel.from_pretrained(model_name).eval()
@@ -131,8 +132,6 @@ class TextEncoder:
             import clip  # noqa: PLC0415
             self._clip = clip
             self.model, _ = clip.load(model_name, device="cpu")
-
-    TEMPLATES = ["a photo of a {}", "a {} in a room", "{}"]
 
     def encode(self, text: str) -> np.ndarray:
         """Prompt-ensembled embedding: average of normalized template embeddings."""
@@ -160,25 +159,39 @@ NEGATIVE_PROMPTS = ["object", "things", "stuff", "texture"]
 
 
 class SearchIndex:
-    """Precomputed structures that sharpen raw CLIP similarity:
+    """Precomputed structures that sharpen raw similarity when needed:
 
     - canonical negative embeddings for LERF-style pairwise-softmax relevancy
-    - a 3D kNN graph with DINO-similarity edge weights for structural smoothing
+    - a 3D kNN graph with DINO-similarity edge weights (disk-cached per scene)
+    - a validity mask excluding points whose features were never observed
     """
 
-    def __init__(self, scene, encoder):
+    def __init__(self, scene, encoder, cache_path: Path = None):
         self.negatives = np.stack([encoder.encode(p) for p in NEGATIVE_PROMPTS])
         self.temperature = encoder.temperature
         # points SAM never covered have (near-)zero features — unrankable noise
-        self.valid = np.linalg.norm(scene["clip"], axis=1) > 0.05
+        self.valid = scene["raw_norms"] > 0.05
         n_invalid = int((~self.valid).sum())
         if n_invalid:
             print(f"Excluding {n_invalid} zero-feature points from ranking")
-        self.nbr_idx = None
-        self.nbr_w = None
-        self.nbr_w_sum = None
+
+        self.nbr_idx = self.nbr_w = self.nbr_w_sum = None
         if scene["dino"] is None:
             return
+        n = len(scene["points"])
+
+        if cache_path and cache_path.exists():
+            try:
+                z = np.load(cache_path)
+                if len(z["idx"]) == n:
+                    self.nbr_idx = z["idx"]
+                    self.nbr_w = z["w"].astype(np.float32)
+                    self.nbr_w_sum = self.nbr_w.sum(axis=1)
+                    print("kNN graph loaded from cache")
+                    return
+            except Exception as e:
+                print(f"cache read failed ({e}), rebuilding")
+
         try:
             from scipy.spatial import cKDTree  # noqa: PLC0415
         except ImportError:
@@ -201,7 +214,10 @@ class SearchIndex:
             w[s:e] = np.clip(np.einsum("nd,nkd->nk", dino[s:e], dino[idx[s:e]]), 0.0, 1.0)
         del dino
         self.nbr_idx, self.nbr_w, self.nbr_w_sum = idx, w, w.sum(axis=1)
-        print(f"Search index ready ({len(idx)} points, k=8)")
+        if cache_path:
+            np.savez(cache_path, idx=idx, w=w.astype(np.float16))
+            print(f"kNN graph cached to {cache_path.name}")
+        print(f"Search index ready ({n} points, k=8)")
 
     def relevancy(self, sims_query, clip_feats):
         """Pairwise softmax vs each negative prompt, take the minimum (LERF)."""
@@ -227,14 +243,74 @@ class SearchIndex:
 
 
 # --------------------------------------------------------------------------- #
+# Scene manager: hot-swap between scene directories
+# --------------------------------------------------------------------------- #
+class SceneManager:
+    def __init__(self, root: Path, initial: str, max_points: int):
+        self.root = root
+        self.max_points = max_points
+        self.lock = threading.Lock()
+        self._encoders = {}
+        self.scene = self.index = self.encoder = None
+        self.name = None
+        self.suggestions = []
+        self.load(initial)
+
+    def list_scenes(self):
+        return sorted(d.name for d in self.root.iterdir() if has_scene_data(d))
+
+    def load(self, name: str):
+        path = self.root / name
+        if not has_scene_data(path):
+            raise FileNotFoundError(f"no scene data in {path}")
+        print(f"\n=== Loading scene '{name}' ===")
+        scene = load_scene(path, self.max_points)
+
+        model_name = None
+        encoder_info = path / "encoder.json"
+        if encoder_info.exists():
+            model_name = json.loads(encoder_info.read_text()).get("clip_model")
+        dim = scene["clip"].shape[1]
+        key = model_name or {512: "ViT-B/32", 768: "ViT-L/14",
+                             1152: "google/siglip2-so400m-patch14-384"}.get(dim, "ViT-B/32")
+        if key not in self._encoders:
+            self._encoders[key] = TextEncoder(dim, key)
+        encoder = self._encoders[key]
+
+        index = SearchIndex(scene, encoder, cache_path=path / "search_cache.npz")
+        suggestions = []
+        sf = path / "suggestions.json"
+        if sf.exists():
+            suggestions = json.loads(sf.read_text())
+
+        with self.lock:
+            self.scene, self.index, self.encoder = scene, index, encoder
+            self.name, self.suggestions = name, suggestions
+        print(f"=== Scene '{name}' ready: {len(scene['points']):,} points, "
+              f"{encoder.version}, DINO {'yes' if scene['dino'] is not None else 'no'} ===\n")
+
+    def current(self):
+        with self.lock:
+            return self.scene, self.index, self.encoder
+
+    def meta(self):
+        with self.lock:
+            return {
+                "scene": self.name,
+                "num_points": len(self.scene["points"]),
+                "clip_model": self.encoder.version,
+                "has_dino": self.scene["dino"] is not None,
+                "suggestions": self.suggestions,
+                "scenes": self.list_scenes(),
+            }
+
+
+# --------------------------------------------------------------------------- #
 # HTTP handler
 # --------------------------------------------------------------------------- #
 class Handler(BaseHTTPRequestHandler):
-    scene = None
-    encoder = None
-    index = None
-    encoder_lock = threading.Lock()
-    meta = {}
+    mgr: SceneManager = None
+    switch_lock = threading.Lock()
 
     def log_message(self, fmt, *args):  # quieter logs
         sys.stderr.write("  " + fmt % args + "\n")
@@ -260,52 +336,69 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._send(404, b"{}")
         elif path == "/api/meta":
-            self._send(200, json.dumps(self.meta).encode())
+            self._send(200, json.dumps(self.mgr.meta()).encode())
         elif path == "/api/pointcloud":
-            s = self.scene
+            scene, _, _ = self.mgr.current()
             buf = io.BytesIO()
-            buf.write(struct.pack("<I", len(s["points"])))
-            buf.write(s["points"].tobytes())
-            buf.write(s["rgb"].tobytes())
+            buf.write(struct.pack("<I", len(scene["points"])))
+            buf.write(scene["points"].tobytes())
+            buf.write(scene["rgb"].tobytes())
             self._send(200, buf.getvalue(), "application/octet-stream")
         else:
             self._send(404, b"{}")
 
     def do_POST(self):
-        if self.path.split("?")[0] != "/api/search":
-            self._send(404, b"{}")
-            return
+        path = self.path.split("?")[0]
         length = int(self.headers.get("Content-Length", 0))
         req = json.loads(self.rfile.read(length) or b"{}")
-        query = (req.get("query") or "").strip()
-        percentile = float(req.get("percentile", 99.0))
-        if not query:
-            self._send(400, b'{"error": "empty query"}')
+
+        if path == "/api/scene":
+            name = req.get("name", "")
+            if name not in self.mgr.list_scenes():
+                self._send(404, json.dumps({"error": f"unknown scene {name!r}"}).encode())
+                return
+            with self.switch_lock:
+                if name != self.mgr.name:
+                    try:
+                        self.mgr.load(name)
+                    except Exception as e:
+                        self._send(500, json.dumps({"error": str(e)}).encode())
+                        return
+            self._send(200, json.dumps(self.mgr.meta()).encode())
             return
 
+        if path != "/api/search":
+            self._send(404, b"{}")
+            return
+
+        query = (req.get("query") or "").strip()
+        percentile = float(req.get("percentile", 99.0))
         # both default off: with sharp SigLIP features + mask-exact crops the raw
         # similarities are already well separated; these help mushy features only
         contrastive = bool(req.get("contrastive", False))
         smoothing = bool(req.get("smooth", False))
+        if not query:
+            self._send(400, b'{"error": "empty query"}')
+            return
 
-        with self.encoder_lock:
-            text_feat = self.encoder.encode(query)
-        sims = self.scene["clip"] @ text_feat
+        scene, index, encoder = self.mgr.current()
+        text_feat = encoder.encode(query)
+        sims = scene["clip"] @ text_feat
 
-        scores = self.index.relevancy(sims, self.scene["clip"]) if contrastive else sims
+        scores = index.relevancy(sims, scene["clip"]) if contrastive else sims
         if smoothing:
-            scores = self.index.smooth(scores)
+            scores = index.smooth(scores)
 
         # break saturated-sigmoid ties with the raw similarity so top-k stays exact
         sims_span = float(sims.max() - sims.min()) or 1.0
         scores = scores + 0.002 * (sims - sims.min()) / sims_span
-        scores[~self.index.valid] = float(scores.min()) - 1.0
+        scores[~index.valid] = float(scores.min()) - 1.0
 
         # exact top-k selection — percentile on a tied plateau overshoots badly
         k = max(1, int(round(len(scores) * (100.0 - percentile) / 100.0)))
         threshold = float(np.partition(scores, len(scores) - k)[len(scores) - k])
         matched = scores >= threshold
-        kept = self.index.coherence_mask(matched)
+        kept = index.coherence_mask(matched)
         scores = scores.astype(np.float32)
         scores[matched & ~kept] = threshold - 1e-4  # drop stray hits below threshold
         matches = int(kept.sum())
@@ -323,37 +416,22 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("scene_dir", type=Path)
+    ap.add_argument("scene_dir", type=Path,
+                    help="a scene directory; its siblings become switchable scenes")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--max-points", type=int, default=1_500_000)
     args = ap.parse_args()
 
-    scene = load_scene(args.scene_dir, args.max_points)
-    print(f"Loaded scene '{args.scene_dir.name}': {len(scene['points']):,} points, "
-          f"CLIP dim {scene['clip'].shape[1]}, DINO {'yes' if scene['dino'] is not None else 'no'}")
+    if has_scene_data(args.scene_dir):
+        root, initial = args.scene_dir.parent, args.scene_dir.name
+    else:
+        root = args.scene_dir
+        candidates = sorted(d.name for d in root.iterdir() if has_scene_data(d))
+        if not candidates:
+            raise SystemExit(f"no scenes found under {root}")
+        initial = candidates[0]
 
-    encoder_info = args.scene_dir / "encoder.json"
-    model_name = None
-    if encoder_info.exists():
-        model_name = json.loads(encoder_info.read_text()).get("clip_model")
-    encoder = TextEncoder(scene["clip"].shape[1], model_name)
-    index = SearchIndex(scene, encoder)
-
-    suggestions = []
-    sf = args.scene_dir / "suggestions.json"
-    if sf.exists():
-        suggestions = json.loads(sf.read_text())
-
-    Handler.scene = scene
-    Handler.encoder = encoder
-    Handler.index = index
-    Handler.meta = {
-        "scene": args.scene_dir.name,
-        "num_points": len(scene["points"]),
-        "clip_model": encoder.version,
-        "has_dino": scene["dino"] is not None,
-        "suggestions": suggestions,
-    }
+    Handler.mgr = SceneManager(root, initial, args.max_points)
 
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     print(f"\n  AFM 3D Search viewer -> http://localhost:{args.port}\n")
