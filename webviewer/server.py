@@ -169,11 +169,20 @@ class SearchIndex:
     def __init__(self, scene, encoder, cache_path: Path = None):
         self.negatives = np.stack([encoder.encode(p) for p in NEGATIVE_PROMPTS])
         self.temperature = encoder.temperature
-        # points SAM never covered have (near-)zero features — unrankable noise
-        self.valid = scene["raw_norms"] > 0.05
+        # Voxels no SAM mask ever covered carry the pipeline's 0.5x global-image
+        # fallback: a frame-average embedding that contains whatever is prominent
+        # in the scene, so it outranks real object voxels (measured: 95% of the
+        # top-k for "plant" were such voxels). Their pre-normalization norm sits
+        # at ~0.5 while mask-covered voxels sit near 1.0, so the norm is a usable
+        # coverage proxy: hard-exclude the pure-fallback population and linearly
+        # down-weight partially covered voxels.
+        raw = scene["raw_norms"]
+        self.valid = raw > 0.55
+        self.coverage = np.clip((raw - 0.5) / 0.45, 0.0, 1.0).astype(np.float32)
         n_invalid = int((~self.valid).sum())
         if n_invalid:
-            print(f"Excluding {n_invalid} zero-feature points from ranking")
+            print(f"Excluding {n_invalid} uncovered (global-fallback) points from ranking "
+                  f"({n_invalid / len(raw):.1%})")
 
         self.nbr_idx = self.nbr_w = self.nbr_w_sum = None
         if scene["dino"] is None:
@@ -392,6 +401,8 @@ class Handler(BaseHTTPRequestHandler):
         # break saturated-sigmoid ties with the raw similarity so top-k stays exact
         sims_span = float(sims.max() - sims.min()) or 1.0
         scores = scores + 0.002 * (sims - sims.min()) / sims_span
+        # partially covered voxels are proportionally less trustworthy
+        scores = scores * index.coverage + (1.0 - index.coverage) * float(scores.min())
         scores[~index.valid] = float(scores.min()) - 1.0
 
         # exact top-k selection — percentile on a tied plateau overshoots badly
