@@ -62,7 +62,10 @@ class _SiglipEncoder:
     def encode_image(self, image: np.ndarray):
         pil_image = Image.fromarray(image.astype(np.uint8))
         inputs = self.processor(images=pil_image, return_tensors="pt").to(self.device)
-        return self.model.get_image_features(**inputs).float()
+        out = self.model.get_image_features(**inputs)
+        if not torch.is_tensor(out):  # transformers>=5 returns an output object
+            out = out.pooler_output if getattr(out, "pooler_output", None) is not None else out[0]
+        return out.float()
 
 
 def make_image_encoder(version: str, device: str):

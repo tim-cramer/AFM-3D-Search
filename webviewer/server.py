@@ -136,7 +136,10 @@ class TextEncoder:
             if self.is_siglip:
                 inputs = self.tokenizer([text], padding="max_length", max_length=64,
                                         truncation=True, return_tensors="pt")
-                feat = self.model.get_text_features(**inputs).float().numpy()[0]
+                out = self.model.get_text_features(**inputs)
+                if not self._torch.is_tensor(out):  # transformers>=5 returns an output object
+                    out = out.pooler_output if getattr(out, "pooler_output", None) is not None else out[0]
+                feat = out.float().numpy()[0]
             else:
                 tokens = self._clip.tokenize([text], truncate=True)
                 feat = self.model.encode_text(tokens).float().numpy()[0]
