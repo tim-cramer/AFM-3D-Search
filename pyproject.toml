@@ -24,8 +24,8 @@ dependencies = [
     "clip @ git+https://github.com/openai/CLIP.git",
     "segment-anything @ git+https://github.com/facebookresearch/segment-anything.git",
 
-    # SigLIP2 image-text encoder
-    "transformers>=4.49",
+    # SigLIP2 image-text encoder (transformers 5.x needs torch>=2.5, we pin 2.3.1)
+    "transformers>=4.49,<5",
     "sentencepiece",
     "protobuf",
     
