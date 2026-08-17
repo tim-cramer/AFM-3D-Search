@@ -375,7 +375,6 @@ $('go').onclick = runSearch;
 $('query').addEventListener('keydown', e => { if (e.key === 'Enter') runSearch(); });
 $('clear-btn').onclick = clearHighlights;
 
-$('pct').onchange = () => { if (lastQuery) { $('query').value = lastQuery; runSearch(); } };
 function pointSizeFactor() {
   return Math.min(Math.max(parseFloat($('size').value) || 1, 0.1), 6);
 }
@@ -385,9 +384,7 @@ $('size').oninput = () => {
   if (highlightPoints) highlightPoints.material.size = baseSize * 2.2 * k;
 };
 $('greyout').onchange = () => { if (lastSims) applyHighlights(); else clearHighlights(); };
-$('contrast').onchange = $('dinosmooth').onchange = () => {
-  if (lastQuery) { $('query').value = lastQuery; runSearch(); }
-};
+// contrast / dinosmooth / pct are read on the next explicit Search click — no auto-rerun
 $('flip').onchange = () => { group.rotation.x = $('flip').checked ? Math.PI : 0; };
 $('size').oninput();
 
