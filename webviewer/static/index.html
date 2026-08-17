@@ -59,9 +59,14 @@
 
   details { margin-top: 16px; }
   summary { font-size: 12.5px; color: var(--muted); cursor: pointer; user-select: none; }
-  .ctl { margin-top: 12px; font-size: 12.5px; color: var(--muted); }
-  .ctl label { display: flex; justify-content: space-between; margin-bottom: 4px; }
-  .ctl input[type=range] { width: 100%; accent-color: var(--accent); }
+  .num-row { display: flex; justify-content: space-between; align-items: center;
+    margin-top: 12px; font-size: 12.5px; color: var(--muted); }
+  .num-row input[type=number] {
+    width: 76px; padding: 6px 8px; font-size: 13px; text-align: right; color: var(--text);
+    background: rgba(255,255,255,0.06); border: 1px solid var(--border); border-radius: 7px; outline: none;
+  }
+  .num-row input[type=number]:focus { border-color: var(--accent); }
+  .num-row .unit { margin-left: 6px; }
   .ctl-check { display: flex; align-items: center; gap: 8px; margin-top: 12px; font-size: 12.5px; color: var(--muted); }
   .ctl-check input { accent-color: var(--accent); }
 
@@ -113,24 +118,24 @@
 
   <details open>
     <summary>Settings</summary>
-    <div class="ctl">
-      <label>Highlight top <span id="pct-val">1%</span></label>
-      <input id="pct" type="range" min="80" max="99.9" step="0.1" value="99">
+    <div class="num-row">
+      <label for="pct">Highlight top</label>
+      <span><input id="pct" type="number" min="0.05" max="50" step="0.05" value="1"><span class="unit">%</span></span>
     </div>
-    <div class="ctl">
-      <label>Point size <span id="size-val"></span></label>
-      <input id="size" type="range" min="0.2" max="3" step="0.05" value="1">
+    <div class="num-row">
+      <label for="size">Point size</label>
+      <span><input id="size" type="number" min="0.1" max="6" step="0.1" value="1"><span class="unit">×</span></span>
     </div>
     <div class="ctl-check">
       <input id="greyout" type="checkbox" checked>
       <label for="greyout">Grey out unmatched points</label>
     </div>
     <div class="ctl-check">
-      <input id="contrast" type="checkbox" checked>
+      <input id="contrast" type="checkbox">
       <label for="contrast">Contrastive scoring</label>
     </div>
     <div class="ctl-check">
-      <input id="dinosmooth" type="checkbox" checked>
+      <input id="dinosmooth" type="checkbox">
       <label for="dinosmooth">DINO smoothing</label>
     </div>
     <div class="ctl-check">
@@ -283,7 +288,8 @@ async function runSearch() {
   $('status').className = '';
   $('status').textContent = 'encoding query…';
   try {
-    const percentile = parseFloat($('pct').value);
+    const topPct = Math.min(Math.max(parseFloat($('pct').value) || 1, 0.02), 50);
+    const percentile = 100 - topPct;
     const res = await fetch('/api/search', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -339,7 +345,7 @@ function applyHighlights() {
   geo.setAttribute('position', new THREE.BufferAttribute(hp, 3));
   geo.setAttribute('color', new THREE.BufferAttribute(hc, 3, true));
   const mat = new THREE.PointsMaterial({
-    size: baseSize * 2.2 * parseFloat($('size').value),
+    size: baseSize * 2.2 * pointSizeFactor(),
     vertexColors: true, sizeAttenuation: true,
   });
   highlightPoints = new THREE.Points(geo, mat);
@@ -369,13 +375,12 @@ $('go').onclick = runSearch;
 $('query').addEventListener('keydown', e => { if (e.key === 'Enter') runSearch(); });
 $('clear-btn').onclick = clearHighlights;
 
-$('pct').oninput = () => {
-  $('pct-val').textContent = (100 - parseFloat($('pct').value)).toFixed(1).replace(/\.0$/, '') + '%';
-  if (lastQuery) { $('query').value = lastQuery; runSearch(); }
-};
+$('pct').onchange = () => { if (lastQuery) { $('query').value = lastQuery; runSearch(); } };
+function pointSizeFactor() {
+  return Math.min(Math.max(parseFloat($('size').value) || 1, 0.1), 6);
+}
 $('size').oninput = () => {
-  const k = parseFloat($('size').value);
-  $('size-val').textContent = k.toFixed(2) + '×';
+  const k = pointSizeFactor();
   if (basePoints) basePoints.material.size = baseSize * k;
   if (highlightPoints) highlightPoints.material.size = baseSize * 2.2 * k;
 };

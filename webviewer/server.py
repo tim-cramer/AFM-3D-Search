@@ -118,8 +118,9 @@ class TextEncoder:
                           1152: "google/siglip2-so400m-patch14-384"}.get(feature_dim, "ViT-B/32")
         self.version = model_name
         self.is_siglip = "siglip" in model_name.lower()
-        # contrastive-softmax temperature; SigLIP cosine gaps are tighter
-        self.temperature = 50.0 if self.is_siglip else 10.0
+        # contrastive-softmax temperature; SigLIP cosine gaps are tighter than
+        # CLIP's, but too steep saturates scores into massive ties at 0/0.5/1
+        self.temperature = 20.0 if self.is_siglip else 10.0
 
         print(f"Loading text encoder {model_name} for {feature_dim}-d features (cpu)...")
         if self.is_siglip:
@@ -162,6 +163,11 @@ class SearchIndex:
     def __init__(self, scene, encoder):
         self.negatives = np.stack([encoder.encode(p) for p in NEGATIVE_PROMPTS])
         self.temperature = encoder.temperature
+        # points SAM never covered have (near-)zero features — unrankable noise
+        self.valid = np.linalg.norm(scene["clip"], axis=1) > 0.05
+        n_invalid = int((~self.valid).sum())
+        if n_invalid:
+            print(f"Excluding {n_invalid} zero-feature points from ranking")
         self.nbr_idx = None
         self.nbr_w = None
         self.nbr_w_sum = None
@@ -271,8 +277,10 @@ class Handler(BaseHTTPRequestHandler):
             self._send(400, b'{"error": "empty query"}')
             return
 
-        contrastive = bool(req.get("contrastive", True))
-        smoothing = bool(req.get("smooth", True))
+        # both default off: with sharp SigLIP features + mask-exact crops the raw
+        # similarities are already well separated; these help mushy features only
+        contrastive = bool(req.get("contrastive", False))
+        smoothing = bool(req.get("smooth", False))
 
         with self.encoder_lock:
             text_feat = self.encoder.encode(query)
@@ -282,7 +290,14 @@ class Handler(BaseHTTPRequestHandler):
         if smoothing:
             scores = self.index.smooth(scores)
 
-        threshold = float(np.percentile(scores, percentile))
+        # break saturated-sigmoid ties with the raw similarity so top-k stays exact
+        sims_span = float(sims.max() - sims.min()) or 1.0
+        scores = scores + 0.002 * (sims - sims.min()) / sims_span
+        scores[~self.index.valid] = float(scores.min()) - 1.0
+
+        # exact top-k selection — percentile on a tied plateau overshoots badly
+        k = max(1, int(round(len(scores) * (100.0 - percentile) / 100.0)))
+        threshold = float(np.partition(scores, len(scores) - k)[len(scores) - k])
         matched = scores >= threshold
         kept = self.index.coherence_mask(matched)
         scores = scores.astype(np.float32)
