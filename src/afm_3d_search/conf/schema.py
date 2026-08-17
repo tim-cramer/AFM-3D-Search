@@ -11,6 +11,7 @@ class ClipModelConfig:
 @dataclass
 class SamModelConfig:
     checkpoint: str
+    crop_n_layers: int = 0
 
 @dataclass
 class DinoModelConfig:

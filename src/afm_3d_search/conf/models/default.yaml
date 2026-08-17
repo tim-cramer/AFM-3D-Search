@@ -8,5 +8,6 @@ clip:
   version: "google/siglip2-so400m-patch14-384"
 sam:
   checkpoint: "sam_vit_h_4b8939.pth"
+  crop_n_layers: 0   # 1 = extra AMG pass for small objects (~3x SAM time)
 dino:
   version: "dinov2_vits14"

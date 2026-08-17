@@ -42,10 +42,13 @@ class _ClipEncoder:
         self.feat_dim = self.model.visual.output_dim
 
     @torch.no_grad()
+    def encode_images(self, images):
+        batch = torch.stack([self.preprocess(Image.fromarray(im.astype(np.uint8))) for im in images]).to(self.device)
+        with torch.autocast(device_type="cuda", enabled=self.device.startswith("cuda")):
+            return self.model.encode_image(batch).float()
+
     def encode_image(self, image: np.ndarray):
-        pil_image = Image.fromarray(image.astype(np.uint8))
-        processed_image = self.preprocess(pil_image).unsqueeze(0).to(self.device)
-        return self.model.encode_image(processed_image).float()
+        return self.encode_images([image])
 
 
 class _SiglipEncoder:
@@ -59,13 +62,17 @@ class _SiglipEncoder:
         self.feat_dim = self.model.config.vision_config.hidden_size
 
     @torch.no_grad()
-    def encode_image(self, image: np.ndarray):
-        pil_image = Image.fromarray(image.astype(np.uint8))
-        inputs = self.processor(images=pil_image, return_tensors="pt").to(self.device)
-        out = self.model.get_image_features(**inputs)
+    def encode_images(self, images):
+        pils = [Image.fromarray(im.astype(np.uint8)) for im in images]
+        inputs = self.processor(images=pils, return_tensors="pt").to(self.device)
+        with torch.autocast(device_type="cuda", enabled=self.device.startswith("cuda")):
+            out = self.model.get_image_features(**inputs)
         if not torch.is_tensor(out):  # transformers>=5 returns an output object
             out = out.pooler_output if getattr(out, "pooler_output", None) is not None else out[0]
         return out.float()
+
+    def encode_image(self, image: np.ndarray):
+        return self.encode_images([image])
 
 
 def make_image_encoder(version: str, device: str):
@@ -96,7 +103,7 @@ class _MaskEmbeddingFeatureImageGenerator:
         # the same surface ends up with patchy, view-inconsistent features)
         accum = torch.zeros(H, W, self.feat_dim, dtype=torch.float32, device=self.device)
         cover = torch.zeros(H, W, dtype=torch.float32, device=self.device)
-        feat_per_roi, roi_nonzero_inds, similarity_scores = [], [], []
+        crops, roi_nonzero_inds = [], []
         mean_color = image_np.reshape(-1, 3).mean(axis=0).astype(image_np.dtype)
 
         for mask in masks:
@@ -111,17 +118,23 @@ class _MaskEmbeddingFeatureImageGenerator:
             seg_roi = mask["segmentation"][y0:y1, x0:x1]
             if img_roi.size == 0 or not seg_roi.any(): continue
             img_roi[~seg_roi] = mean_color
-            roifeat = torch.nn.functional.normalize(self.image_text_encoder.encode_image(img_roi), dim=-1)
-            feat_per_roi.append(roifeat)
+            crops.append(img_roi)
             roi_nonzero_inds.append(torch.from_numpy(mask["segmentation"]).to(self.device))
-            similarity_scores.append(self.cosine_similarity(global_feat, roifeat))
 
-        if feat_per_roi:
-            softmax_scores = torch.nn.functional.softmax(torch.cat(similarity_scores), dim=0)
+        if crops:
+            # batched ROI encoding — one-by-one forwards dominated the runtime
+            batch_size = 16
+            roifeats = torch.cat([
+                self.image_text_encoder.encode_images(crops[s:s + batch_size])
+                for s in range(0, len(crops), batch_size)
+            ], dim=0)
+            roifeats = torch.nn.functional.normalize(roifeats, dim=-1)                    # (M,D)
+            softmax_scores = torch.nn.functional.softmax(
+                self.cosine_similarity(global_feat, roifeats), dim=0)                     # (M,)
+            weighted = torch.nn.functional.normalize(
+                softmax_scores[:, None] * global_feat + (1 - softmax_scores[:, None]) * roifeats, dim=-1)
             for i, mask_seg in enumerate(roi_nonzero_inds):
-                weighted_feat = torch.nn.functional.normalize(
-                    softmax_scores[i] * global_feat + (1 - softmax_scores[i]) * feat_per_roi[i], dim=-1)
-                accum[mask_seg] += weighted_feat.squeeze(0).float()
+                accum[mask_seg] += weighted[i].float()
                 cover[mask_seg] += 1.0
 
         covered = cover > 0
@@ -185,7 +198,7 @@ def extract_dino_features_from_pil(pil_images, dino_version, target_height, targ
     return feature_file_paths 
 
 
-def extract_clip_features_from_pil(pil_images: List[Image.Image], clip_version: str, sam_checkpoint_filename: str, target_height: int, target_width: int, device: str, output_dir: Path, sink=None) -> List[Path]:
+def extract_clip_features_from_pil(pil_images: List[Image.Image], clip_version: str, sam_checkpoint_filename: str, target_height: int, target_width: int, device: str, output_dir: Path, sink=None, crop_n_layers: int = 0) -> List[Path]:
     print("📎 Initializing SAM and CLIP models...")
     
     WEIGHTS_DIR = Path("weights")
@@ -196,9 +209,10 @@ def extract_clip_features_from_pil(pil_images: List[Image.Image], clip_version: 
 
     sam_model = sam_model_registry["vit_h"](checkpoint=sam_checkpoint_path).to(device)
 
-    # crop_n_layers=1: extra AMG pass on image crops for small-object coverage;
-    # min_mask_region_area filters speckle masks (needs opencv)
-    mask_generator = SamAutomaticMaskGenerator(sam_model, crop_n_layers=1, min_mask_region_area=100)
+    # crop_n_layers=1 adds an AMG pass on image crops (better small-object
+    # coverage, ~3x SAM cost) — off by default, enable via models.sam.crop_n_layers
+    mask_generator = SamAutomaticMaskGenerator(
+        sam_model, crop_n_layers=crop_n_layers, min_mask_region_area=100)
     clip_encoder = make_image_encoder(clip_version, device)
     feature_generator = _MaskEmbeddingFeatureImageGenerator(mask_generator, clip_encoder, device)
 
@@ -240,7 +254,8 @@ def run(pil_images: List[Image.Image], vggt_output: Dict, cfg: DictConfig, devic
 
     clip_paths = extract_clip_features_from_pil(
         pil_images, cfg.models.clip.version, cfg.models.sam.checkpoint, vggt_output['height'], vggt_output['width'], device, output_dir,
-        sink=aggregator.add_clip if aggregator is not None else None
+        sink=aggregator.add_clip if aggregator is not None else None,
+        crop_n_layers=getattr(cfg.models.sam, "crop_n_layers", 0)
     )
 
     gc.collect()
