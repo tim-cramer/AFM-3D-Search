@@ -1,3 +1,0 @@
-# Network port for gRPC server (optional)
-  mode: remote # local, remote
-  port: 9876

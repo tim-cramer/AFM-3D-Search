@@ -1,147 +1,50 @@
-# AFM 3D Search
+# Demo Walkthrough
 
+End-to-end: images → featurized point cloud (GPU) → interactive search in the browser (no GPU).
 
-## ⚙️  Setup
+## 1. Process a scene (GPU machine)
 
-```
-# 1. Install uv (a fast Python package installer)
-curl -LsSf https://astral.sh/uv/install.sh | sh
-source $HOME/.local/bin/env
-
-# 2. Clone Repo
-git clone https://github.com/lorenz369/AFM-3D-Search.git
-git switch feat/add-scene-processing-endpoint
-cd AFM-3D-Search/
-git submodule update --init --recursive
-
-# 3. Create venv and install dependencies
-uv venv
-source .venv/bin/activate
-uv pip install -e .
-
-# 4. install vggt
-cd submodules/vggt
-uv pip install -e .
-cd ../..
-```
-
-setup.sh
-
-````
-#!/bin/bash
-
-set -e  # Exit on any error
-
-echo "🚀 Starting AFM-3D-Search setup..."
-
-# 1. Install uv (a fast Python package installer)
-echo "📦 Installing uv..."
-curl -LsSf https://astral.sh/uv/install.sh | sh
-source $HOME/.local/bin/env
-
-# 2. Clone Repo
-echo "📥 Cloning repository..."
-git clone https://github.com/lorenz369/AFM-3D-Search.git
-cd AFM-3D-Search/
-git switch feat/add-scene-processing-endpoint
-git submodule update --init --recursive
-
-# 3. Create venv and install dependencies
-echo "🐍 Creating virtual environment and installing dependencies..."
-uv venv
-source .venv/bin/activate
-uv pip install -e .
-
-# 4. Install vggt
-echo "🔧 Installing vggt submodule..."
-cd submodules/vggt
-uv pip install -e .
-cd ../..
-
-echo "✅ Setup complete! Virtual environment is activated."
-echo "💡 To activate the environment in the future, run: source AFM-3D-Search/.venv/bin/activate"
-````
-
-```
-chmod +x setup.sh
-./setup.sh
-```
-
-## Usage
-
-There are three primary ways to use this project: running the full pipeline on a local dataset, analyzing the results of a processed scene, or deploying the full API service.
-
-A **`scene_id`** is required for most commands and corresponds to the name of a scene's data folder (e.g., `bude`).
-
-### 1. Running the Full Pipeline
-
-Use this method to process a directory of images into a 3D point cloud with extracted features. This is ideal for development and testing.
-
-The pipeline reads images from `data/testing/<scene_id>/images/` and saves the final artifacts to `data/completed/<scene_id>/`.
-
-#### **Standard Run**
+Set up once — see [README](README.md#setup-pipeline-gpu-machine) or run `scripts/setup_gpu_instance.sh`. Then:
 
 ```bash
-# Process the 'bude' scene with the default models
+# images live in data/testing/<scene_id>/images/
 python src/afm_3d_search/run_pipeline.py scene_id=bude
 ```
 
-#### **Run with Different Models**
+First run downloads model weights (VGGT-Ω ~4.6 GB, SAM ViT-H ~2.4 GB, CLIP ViT-L/14 ~0.9 GB, DINOv2-S). Expect ~20–40 min per ~50-frame scene on an A100 slice; SAM mask generation dominates.
 
-You can easily swap model configurations by referencing other files in the `conf/models/` directory. This is perfect for quick experiments.
+Output lands in `data/completed/<scene_id>/`:
 
-```bash
-# Run with faster, lower-VRAM models defined in 'conf/models/fast_test.yaml'
-python src/afm_3d_search/run_pipeline.py scene_id=bude models=fast_test
+```
+point_cloud.ply      # aggregated colored point cloud
+clip_features.npy    # per-point CLIP features (search)
+dino_features.npy    # per-point DINOv2 features (structural filtering)
 ```
 
-### 2. Analyzing a Processed Scene
-
-Once a scene has been processed, you can use the highlight scripts to perform analysis. These scripts read from `data/completed/<scene_id>/` and save their output (a colored `.ply` file) to a new, timestamped folder in `outputs/`.
-
-#### **Text-based Search (CLIP)**
+## 2. Fetch results to your laptop
 
 ```bash
-# Analyze the 'bude' scene with the default text query
-python scripts/highlight_clip.py scene_id=bude
-
-# Override the text query from the command line
-python scripts/highlight_clip.py scene_id=bude highlight.text_query="a red chair"
+rsync -avz <gpu-host>:AFM-3D-Search/data/completed/bude data/completed/
 ```
 
-#### **Similarity Search (DINO)**
+## 3. Search in the browser (CPU only)
 
 ```bash
-# Analyze 'bude' using a default starting point for similarity search
-python scripts/highlight_dino.py scene_id=bude
-
-# Specify a different point index and search radius (top_k)
-python scripts/highlight_dino.py scene_id=bude highlight.query_point_index=50000 highlight.top_k=1000
+uv venv .viewer_env --python 3.11 && source .viewer_env/bin/activate
+uv pip install -r webviewer/requirements.txt
+python webviewer/server.py data/completed/bude --port 8090
 ```
 
-### 3. Running as an API Service
+Open http://localhost:8090 — type queries ("backpack", "red chair"), matched points highlight; sliders control highlight percentile and point size.
 
-This runs the project as a live service that accepts image uploads via an HTTP endpoint. This requires two separate terminals.
-
-#### **Terminal 1: Start the API Server**
-
-This command starts the web server, which listens for uploads on port 8000. Uploaded images are saved to the `data/staging/` directory.
+## Optional: API service
 
 ```bash
-uvicorn src.afm_3d_search.api.main:app --host 0.0.0.0 --port 8000 --reload
-```
+# Terminal 1 — accepts image uploads on :8000
+uvicorn src.afm_3d_search.api.main:app --host 0.0.0.0 --port 8000
 
-#### **Terminal 2: Start the Worker**
-
-This command starts the background worker, which polls for new jobs created by the API server and processes them using the main pipeline.
-
-```bash
+# Terminal 2 — worker polls jobs and runs the pipeline
 python src/afm_3d_search/worker.py
 ```
-Once both services are running, you can `POST` multiple image files to the `http://localhost:8000/v1/scenes` endpoint to create a new processing job.
 
-##### **Terminal 3 (only local): Start the Tunnel**
-
-```
-ssh -L 0.0.0.0:8080:localhost:8000 atcremersXX.in.tum.de
-```
+POST image files to `http://localhost:8000/v1/scenes` to queue a scene.

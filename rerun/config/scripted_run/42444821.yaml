@@ -1,5 +1,0 @@
-enabled: true  # Set to true to run the queries below instead of an interactive session
-queries:
-  - "ball"
-  - "plants"
-  - "clear" # Clears the last highlight

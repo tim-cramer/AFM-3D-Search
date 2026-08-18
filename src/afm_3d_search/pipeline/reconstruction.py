@@ -4,12 +4,84 @@ from typing import List, Dict
 import torchvision.transforms.functional as TF
 import numpy as np
 import gc
-import torchvision.transforms.functional as TF
-import numpy as np
 
-from vggt.models.vggt import VGGT
-from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+VGGT_WEIGHTS_URL = "https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt"
+# Gated repo (Fair Noncommercial Research License): accept the license on
+# huggingface.co and authenticate once via `huggingface-cli login`.
+VGGT_OMEGA_REPO = "facebook/VGGT-Omega"
+VGGT_OMEGA_CHECKPOINT = "vggt_omega_1b_512.pt"
 
+
+def run(image_paths: List[str], pil_images: List[Image.Image], cfg, device: str, dtype: torch.dtype) -> Dict:
+    """Dispatch to the configured reconstruction backbone.
+
+    Every backbone returns the same contract dict consumed by
+    feature_extraction and processing:
+        depth_tensor (1,S,H,W,1), confidence_tensor (1,S,H,W),
+        images_tensor (1,S,3,H,W), extrinsic_tensor (1,S,3,4),
+        intrinsic_tensor (1,S,3,3), height, width
+    """
+    backbone = cfg.models.recon.backbone
+    if backbone == "vggt_omega":
+        return run_vggt_omega(image_paths, cfg.models.recon.image_resolution, device, dtype)
+    elif backbone == "vggt":
+        return run_vggt(pil_images, device, dtype)
+    raise ValueError(f"Unknown reconstruction backbone: {backbone!r} (expected 'vggt_omega' or 'vggt')")
+
+
+def _with_batch_dim(t: torch.Tensor, num_frames: int) -> torch.Tensor:
+    """Ensure a leading batch dimension of 1 in front of the frame dimension."""
+    return t.unsqueeze(0) if t.shape[0] == num_frames else t
+
+
+def run_vggt_omega(image_paths: List[str], image_resolution: int, device: str, dtype: torch.dtype) -> Dict:
+    """VGGT-Omega (CVPR 2026) — ~30% of VGGT's memory, 1.6x faster inference."""
+    from vggt_omega.models import VGGTOmega
+    from vggt_omega.utils.load_fn import load_and_preprocess_images
+    from vggt_omega.utils.pose_enc import encoding_to_camera
+
+    from huggingface_hub import hf_hub_download
+
+    print(f"🔄 Initializing VGGT-Omega on {device}...")
+    model = VGGTOmega()
+    checkpoint_path = hf_hub_download(repo_id=VGGT_OMEGA_REPO, filename=VGGT_OMEGA_CHECKPOINT)
+    state_dict = torch.load(checkpoint_path, map_location="cpu")
+    model.load_state_dict(state_dict)
+    model.eval().to(device)
+    del state_dict
+
+    images = load_and_preprocess_images(image_paths, image_resolution=image_resolution).to(device)
+    num_frames = images.shape[0] if images.dim() == 4 else images.shape[1]
+
+    print(f"🚀 Running VGGT-Omega inference on {num_frames} frames...")
+    with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=dtype, enabled=device == "cuda"):
+        predictions = model(images)
+
+    depth = _with_batch_dim(predictions["depth"], num_frames)
+    if depth.shape[-1] != 1:
+        depth = depth[..., None]
+    confidence = _with_batch_dim(predictions["depth_conf"], num_frames)
+    images_tensor = _with_batch_dim(predictions.get("images", images), num_frames)
+    H, W = images_tensor.shape[-2:]
+
+    extrinsic, intrinsic = encoding_to_camera(predictions["pose_enc"], (H, W))
+    extrinsic = _with_batch_dim(extrinsic, num_frames)
+    intrinsic = _with_batch_dim(intrinsic, num_frames)
+
+    print("🧹 Cleaning up VGGT-Omega model from GPU memory...")
+    del model
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    return {
+        "depth_tensor": depth,
+        "confidence_tensor": confidence,
+        "images_tensor": images_tensor,
+        "extrinsic_tensor": extrinsic,
+        "intrinsic_tensor": intrinsic,
+        "height": H,
+        "width": W,
+    }
 
 
 def _preprocess_single_image(img: Image.Image, mode: str = "crop", target_size: int = 518) -> torch.Tensor:
@@ -62,9 +134,12 @@ def run_vggt(pil_images: List[Image.Image], device: str, dtype: torch.dtype) -> 
     """
     Runs VGGT reconstruction and returns a dictionary of raw GPU tensors.
     """
+    from vggt.models.vggt import VGGT
+    from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+
     print(f"🔄 Initializing VGGT model on {device}...")
     vggt_model = VGGT()
-    vggt_model.load_state_dict(torch.hub.load_state_dict_from_url("https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt", map_location=device))
+    vggt_model.load_state_dict(torch.hub.load_state_dict_from_url(VGGT_WEIGHTS_URL, map_location=device))
     vggt_model.eval().to(device)
 
     # Preprocess all images using our new helper function

@@ -14,6 +14,8 @@ dependencies = [
     "numpy>=1.24.0,<2.0.0",
     "Pillow",
     "huggingface_hub",
+    "requests",
+    "tqdm",
     "einops",
     "safetensors",
     "trimesh",
@@ -21,6 +23,11 @@ dependencies = [
     # ML models from git
     "clip @ git+https://github.com/openai/CLIP.git",
     "segment-anything @ git+https://github.com/facebookresearch/segment-anything.git",
+
+    # SigLIP2 image-text encoder (transformers 5.x needs torch>=2.5, we pin 2.3.1)
+    "transformers>=4.49,<5",
+    "sentencepiece",
+    "protobuf",
     
     # Machine learning utilities
     "scikit-learn",

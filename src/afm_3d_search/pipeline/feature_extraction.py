@@ -32,17 +32,53 @@ def _download_file(url, destination: Path):
             f.write(chunk)
             bar.update(len(chunk))
 
-# --- Helper Classes for CLIP/SAM Blending ---
+# --- Helper Classes for CLIP/SigLIP + SAM Blending ---
 class _ClipEncoder:
+    """OpenAI CLIP (e.g. 'ViT-L/14')."""
+
     def __init__(self, version, device):
         self.device = device
         self.model, self.preprocess = clip.load(version.replace("_", "/"), device=self.device, jit=False)
+        self.feat_dim = self.model.visual.output_dim
 
     @torch.no_grad()
+    def encode_images(self, images):
+        batch = torch.stack([self.preprocess(Image.fromarray(im.astype(np.uint8))) for im in images]).to(self.device)
+        with torch.autocast(device_type="cuda", enabled=self.device.startswith("cuda")):
+            return self.model.encode_image(batch).float()
+
     def encode_image(self, image: np.ndarray):
-        pil_image = Image.fromarray(image.astype(np.uint8))
-        processed_image = self.preprocess(pil_image).unsqueeze(0).to(self.device)
-        return self.model.encode_image(processed_image).float()
+        return self.encode_images([image])
+
+
+class _SiglipEncoder:
+    """SigLIP/SigLIP2 via HF transformers (e.g. 'google/siglip2-so400m-patch14-384')."""
+
+    def __init__(self, version, device):
+        from transformers import AutoModel, AutoProcessor
+        self.device = device
+        self.model = AutoModel.from_pretrained(version).to(device).eval()
+        self.processor = AutoProcessor.from_pretrained(version)
+        self.feat_dim = self.model.config.vision_config.hidden_size
+
+    @torch.no_grad()
+    def encode_images(self, images):
+        pils = [Image.fromarray(im.astype(np.uint8)) for im in images]
+        inputs = self.processor(images=pils, return_tensors="pt").to(self.device)
+        with torch.autocast(device_type="cuda", enabled=self.device.startswith("cuda")):
+            out = self.model.get_image_features(**inputs)
+        if not torch.is_tensor(out):  # transformers>=5 returns an output object
+            out = out.pooler_output if getattr(out, "pooler_output", None) is not None else out[0]
+        return out.float()
+
+    def encode_image(self, image: np.ndarray):
+        return self.encode_images([image])
+
+
+def make_image_encoder(version: str, device: str):
+    if "siglip" in version.lower():
+        return _SiglipEncoder(version, device)
+    return _ClipEncoder(version, device)
 
 class _MaskEmbeddingFeatureImageGenerator:
     def __init__(self, mask_generator, image_text_encoder, device):
@@ -50,41 +86,68 @@ class _MaskEmbeddingFeatureImageGenerator:
         self.image_text_encoder = image_text_encoder
         self.cosine_similarity = torch.nn.CosineSimilarity(dim=-1)
         self.device = device
-        self.feat_dim = self.image_text_encoder.model.visual.output_dim
+        self.feat_dim = self.image_text_encoder.feat_dim
 
     @torch.no_grad()
     def generate_features(self, image_np: np.ndarray):
         masks = self.mask_generator.generate(image_np)
         masks = list(filter(lambda x: x["bbox"][2] * x["bbox"][3] != 0, masks))
-        if not masks: return torch.zeros(image_np.shape[0], image_np.shape[1], self.feat_dim, dtype=torch.half, device=self.device)
 
         with torch.cuda.amp.autocast(enabled=self.device.startswith("cuda")):
             global_feat = self.image_text_encoder.encode_image(image_np)
             global_feat = torch.nn.functional.normalize(global_feat, dim=-1)
 
-        outfeat = torch.zeros(image_np.shape[0], image_np.shape[1], self.feat_dim, dtype=torch.half, device=self.device)
-        feat_per_roi, roi_nonzero_inds, similarity_scores = [], [], []
+        H, W = image_np.shape[0], image_np.shape[1]
+        # float32 accumulators: overlapping masks are BLENDED per pixel instead of
+        # overwriting each other (part/whole masks otherwise win arbitrarily and
+        # the same surface ends up with patchy, view-inconsistent features)
+        accum = torch.zeros(H, W, self.feat_dim, dtype=torch.float32, device=self.device)
+        cover = torch.zeros(H, W, dtype=torch.float32, device=self.device)
+        crops, roi_nonzero_inds = [], []
+        mean_color = image_np.reshape(-1, 3).mean(axis=0).astype(image_np.dtype)
 
         for mask in masks:
             _x, _y, _w, _h = map(int, mask["bbox"])
-            img_roi = image_np[_y:_y+_h, _x:_x+_w]
-            if img_roi.size == 0: continue
-            roifeat = torch.nn.functional.normalize(self.image_text_encoder.encode_image(img_roi), dim=-1)
-            feat_per_roi.append(roifeat)
+            # Mask-exact crop: pad the bbox slightly for context, then neutralize
+            # everything outside SAM's segmentation so the embedding describes
+            # the object, not its rectangular surroundings.
+            pad = max(4, int(0.1 * max(_w, _h)))
+            y0, y1 = max(0, _y - pad), min(image_np.shape[0], _y + _h + pad)
+            x0, x1 = max(0, _x - pad), min(image_np.shape[1], _x + _w + pad)
+            img_roi = image_np[y0:y1, x0:x1].copy()
+            seg_roi = mask["segmentation"][y0:y1, x0:x1]
+            if img_roi.size == 0 or not seg_roi.any(): continue
+            img_roi[~seg_roi] = mean_color
+            crops.append(img_roi)
             roi_nonzero_inds.append(torch.from_numpy(mask["segmentation"]).to(self.device))
-            similarity_scores.append(self.cosine_similarity(global_feat, roifeat))
 
-        if not feat_per_roi: return outfeat
+        if crops:
+            # batched ROI encoding — one-by-one forwards dominated the runtime
+            batch_size = 16
+            roifeats = torch.cat([
+                self.image_text_encoder.encode_images(crops[s:s + batch_size])
+                for s in range(0, len(crops), batch_size)
+            ], dim=0)
+            roifeats = torch.nn.functional.normalize(roifeats, dim=-1)                    # (M,D)
+            softmax_scores = torch.nn.functional.softmax(
+                self.cosine_similarity(global_feat, roifeats), dim=0)                     # (M,)
+            weighted = torch.nn.functional.normalize(
+                softmax_scores[:, None] * global_feat + (1 - softmax_scores[:, None]) * roifeats, dim=-1)
+            for i, mask_seg in enumerate(roi_nonzero_inds):
+                accum[mask_seg] += weighted[i].float()
+                cover[mask_seg] += 1.0
 
-        softmax_scores = torch.nn.functional.softmax(torch.cat(similarity_scores), dim=0)
-        for i, mask_seg in enumerate(roi_nonzero_inds):
-            weighted_feat = torch.nn.functional.normalize(softmax_scores[i] * global_feat + (1 - softmax_scores[i]) * feat_per_roi[i], dim=-1).half()
-            outfeat[mask_seg] = weighted_feat
-        return outfeat
+        covered = cover > 0
+        if covered.any():
+            accum[covered] = torch.nn.functional.normalize(accum[covered], dim=-1)
+        # pixels no mask ever covered: weak global-image fallback (0.5x) so they
+        # stay searchable instead of being zero-feature holes
+        accum[~covered] = 0.5 * global_feat.squeeze(0).float()
+        return accum.half()
 
 
 # --- Main Feature Extraction Functions ---
-def extract_dino_features_from_pil(pil_images, dino_version, target_height, target_width, device, batch_size, output_dir):
+def extract_dino_features_from_pil(pil_images, dino_version, target_height, target_width, device, batch_size, output_dir, sink=None):
 
     print(f"🦖 Initializing DINOv2 model ({dino_version})...")
     dinov2_model = torch.hub.load('facebookresearch/dinov2', dino_version, verbose=False).to(device).eval()
@@ -92,8 +155,13 @@ def extract_dino_features_from_pil(pil_images, dino_version, target_height, targ
     temp_features_dir = output_dir / "temp_dino_features"
     temp_features_dir.mkdir(parents=True, exist_ok=True)
 
+    # DINOv2 requires dims divisible by its patch size (14); the recon backbone
+    # may produce e.g. 16-divisible dims. Run DINO on the nearest 14-divisible
+    # size, then interpolate features back to the target grid below.
+    dino_height = max(14, round(target_height / 14) * 14)
+    dino_width = max(14, round(target_width / 14) * 14)
     dino_transforms = transforms.Compose([
-        transforms.Resize((target_height, target_width)),
+        transforms.Resize((dino_height, dino_width)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
@@ -109,23 +177,28 @@ def extract_dino_features_from_pil(pil_images, dino_version, target_height, targ
             patch_features = features_dict['x_norm_patchtokens']
 
             B, N, D = patch_features.shape
-            H_patch = target_height // 14
-            W_patch = target_width // 14
+            H_patch = dino_height // 14
+            W_patch = dino_width // 14
 
             feature_map_2d = patch_features.reshape(B, H_patch, W_patch, D).permute(0, 3, 1, 2)
             upsampled_features = torch.nn.functional.interpolate(
                 feature_map_2d, size=(target_height, target_width), mode='bilinear', align_corners=False
             )
-            batch_filepath = temp_features_dir / f"batch_{i}.pt"
-            torch.save(upsampled_features.cpu(), batch_filepath) # Move to CPU and save
-            feature_file_paths.append(batch_filepath)
+            if sink is not None:
+                for j in range(upsampled_features.shape[0]):
+                    sink(i + j, upsampled_features[j].permute(1, 2, 0))
+            else:
+                batch_filepath = temp_features_dir / f"batch_{i}.pt"
+                # fp16 halves the on-disk footprint (~300MB/frame at full res otherwise)
+                torch.save(upsampled_features.half().cpu(), batch_filepath)
+                feature_file_paths.append(batch_filepath)
     del dinov2_model
     torch.cuda.empty_cache()
 
     return feature_file_paths 
 
 
-def extract_clip_features_from_pil(pil_images: List[Image.Image], clip_version: str, sam_checkpoint_filename: str, target_height: int, target_width: int, device: str, output_dir: Path) -> List[Path]:
+def extract_clip_features_from_pil(pil_images: List[Image.Image], clip_version: str, sam_checkpoint_filename: str, target_height: int, target_width: int, device: str, output_dir: Path, sink=None, crop_n_layers: int = 0) -> List[Path]:
     print("📎 Initializing SAM and CLIP models...")
     
     WEIGHTS_DIR = Path("weights")
@@ -136,8 +209,11 @@ def extract_clip_features_from_pil(pil_images: List[Image.Image], clip_version: 
 
     sam_model = sam_model_registry["vit_h"](checkpoint=sam_checkpoint_path).to(device)
 
-    mask_generator = SamAutomaticMaskGenerator(sam_model)
-    clip_encoder = _ClipEncoder(version=clip_version, device=device)
+    # crop_n_layers=1 adds an AMG pass on image crops (better small-object
+    # coverage, ~3x SAM cost) — off by default, enable via models.sam.crop_n_layers
+    mask_generator = SamAutomaticMaskGenerator(
+        sam_model, crop_n_layers=crop_n_layers, min_mask_region_area=100)
+    clip_encoder = make_image_encoder(clip_version, device)
     feature_generator = _MaskEmbeddingFeatureImageGenerator(mask_generator, clip_encoder, device)
 
     # --- Create a temporary directory for CLIP feature batches ---
@@ -151,16 +227,13 @@ def extract_clip_features_from_pil(pil_images: List[Image.Image], clip_version: 
             resized_image = image.resize((target_width, target_height))
             # Generate the feature tensor for the single image
             feature_tensor = feature_generator.generate_features(np.array(resized_image))
-            
-            # ❌ INSTEAD OF THIS:
-            # all_features.append(feature_tensor)
 
-            # ✅ DO THIS:
-            # Define a unique path for the current image's features
-            image_filepath = temp_features_dir / f"image_{i}.pt"
-            # Move tensor to CPU, save it to disk, and store the path
-            torch.save(feature_tensor.cpu(), image_filepath)
-            feature_file_paths.append(image_filepath)
+            if sink is not None:
+                sink(i, feature_tensor)
+            else:
+                image_filepath = temp_features_dir / f"image_{i}.pt"
+                torch.save(feature_tensor.cpu(), image_filepath)
+                feature_file_paths.append(image_filepath)
 
     del sam_model, mask_generator, clip_encoder, feature_generator
     gc.collect()
@@ -170,15 +243,19 @@ def extract_clip_features_from_pil(pil_images: List[Image.Image], clip_version: 
 
 
 # --- Main Run Function ---
-def run(pil_images: List[Image.Image], vggt_output: Dict, cfg: DictConfig, device: str,  output_dir) -> Dict:
-    """Extracts all configured features and returns them as GPU tensors."""
-    
+def run(pil_images: List[Image.Image], vggt_output: Dict, cfg: DictConfig, device: str,  output_dir, aggregator=None) -> Dict:
+    """Extracts all configured features. With an aggregator, features are
+    voxel-accumulated on the fly instead of being written to temp files."""
+
     dino_paths = extract_dino_features_from_pil(
-        pil_images, cfg.models.dino.version, vggt_output['height'], vggt_output['width'], device, cfg.processing.dino_batch_size, output_dir
+        pil_images, cfg.models.dino.version, vggt_output['height'], vggt_output['width'], device, cfg.processing.dino_batch_size, output_dir,
+        sink=aggregator.add_dino if aggregator is not None else None
     )
-    
+
     clip_paths = extract_clip_features_from_pil(
-        pil_images, cfg.models.clip.version, cfg.models.sam.checkpoint, vggt_output['height'], vggt_output['width'], device, output_dir
+        pil_images, cfg.models.clip.version, cfg.models.sam.checkpoint, vggt_output['height'], vggt_output['width'], device, output_dir,
+        sink=aggregator.add_clip if aggregator is not None else None,
+        crop_n_layers=getattr(cfg.models.sam, "crop_n_layers", 0)
     )
 
     gc.collect()

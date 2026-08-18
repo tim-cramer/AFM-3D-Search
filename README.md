@@ -1,157 +1,55 @@
 # AFM 3D Search — Natural-Language Object Search in 3D Scenes
 
-Reconstruct a 3D scene from plain RGB video and search it with natural language ("red chair", "laptop on the desk") — training-free, built entirely from pretrained foundation models.
+Reconstruct a 3D scene from plain RGB images and search it with natural language ("red chair", "laptop on the desk") — training-free, built entirely from pretrained foundation models.
 
 **Team:** Marco Lorenz ([@lorenz369](https://github.com/lorenz369)), Sami Haddouti ([@SamiHaddouti](https://github.com/SamiHaddouti)), Tim Cramer ([@tim-cramer](https://github.com/tim-cramer)) — developed in the Applied Foundation Models practical course at TUM.
 
 ## How it works
 
-1. **Reconstruction** — [VGGT](https://github.com/facebookresearch/vggt) (git submodule) turns an RGB video into a dense 3D point cloud; dense SLAM (MASt3R-SLAM) and ARKit Visual-Inertial Odometry were evaluated as alternative reconstruction sources (`src/afm_3d_search/pipeline/reconstruction.py`).
-2. **Featurization** — each point is enriched with CLIP semantics and DINO features, with SAM providing segmentation masks (`src/afm_3d_search/pipeline/feature_extraction.py`).
-3. **Search** — a text query is embedded with CLIP and matched against the featurized point cloud; configurable outlier detection and DINO-based structural filtering sharpen the hits.
-4. **Visualization** — interactive [Rerun](https://rerun.io/) viewer, either local or streamed from a remote GPU server (`rerun/`).
+1. **Reconstruction** — [VGGT-Ω](https://github.com/facebookresearch/vggt-omega) (default) or [VGGT](https://github.com/facebookresearch/vggt) turns RGB images into dense per-frame depth + camera poses, unprojected to a 3D point cloud (`src/afm_3d_search/pipeline/reconstruction.py`). The backbone is switchable via `models.recon.backbone=vggt_omega|vggt`.
+2. **Featurization** — each point is enriched with CLIP semantics (SAM-mask-blended, ViT-L/14) and DINOv2 structural features (`src/afm_3d_search/pipeline/feature_extraction.py`).
+3. **Search & visualization** — a browser-based viewer ([`webviewer/`](webviewer/)): type a query, it is CLIP-encoded on CPU and matched against the featurized cloud; hits light up in 3D. No GPU needed for this step.
 
-A FastAPI service with a job queue (`src/afm_3d_search/api/`, `worker.py`) wraps the pipeline for end-to-end scene processing. See [DEMO.md](DEMO.md) for a step-by-step walkthrough and [RERUN_demo.md](RERUN_demo.md) for the visualization demo.
+A FastAPI service with a job queue (`src/afm_3d_search/api/`, `worker.py`) wraps the pipeline for end-to-end scene processing. See [DEMO.md](DEMO.md) for a step-by-step walkthrough.
 
-## Table of Contents
-- [Data](#data)
-- [Setup](#setup)
-- [Visualization of Point Clouds](#visualization-of-point-clouds)
+## Setup (pipeline, GPU machine)
+
+```bash
+git clone --recursive https://github.com/tim-cramer/AFM-3D-Search.git
+cd AFM-3D-Search
+uv venv && source .venv/bin/activate
+uv pip install -e .
+uv pip install -e submodules/vggt                                        # only for backbone=vggt
+uv pip install --no-deps "vggt-omega @ git+https://github.com/facebookresearch/vggt-omega.git"
+```
+
+Or run [`scripts/setup_gpu_instance.sh`](scripts/setup_gpu_instance.sh) on a fresh Ubuntu GPU box.
+
+The VGGT-Ω weights are gated on Hugging Face (Fair Noncommercial Research License): accept the license at [facebook/VGGT-Omega](https://huggingface.co/facebook/VGGT-Omega) and authenticate once with `huggingface-cli login`.
+
+**GPU requirements:** peak memory is the reconstruction forward pass over all frames at once. With VGGT-Ω, ~50 frames fit comfortably in 20 GB (half A100); original VGGT needs roughly 3× that. SAM/CLIP/DINO run sequentially afterwards and fit in 8 GB.
+
+## Running the pipeline
+
+Images go in `data/testing/<scene_id>/images/`, artifacts come out in `data/completed/<scene_id>/` (`point_cloud.ply`, `clip_features.npy`, `dino_features.npy`):
+
+```bash
+python src/afm_3d_search/run_pipeline.py scene_id=bude
+python src/afm_3d_search/run_pipeline.py scene_id=bude models.recon.backbone=vggt   # original VGGT
+```
+
+## Interactive search (no GPU)
+
+```bash
+python webviewer/server.py data/completed/bude --port 8090   # then open http://localhost:8090
+```
+
+See [webviewer/README.md](webviewer/README.md) for details and a synthetic test scene that works without any processed data.
 
 ## Data
-Large datasets and results are available in our [Google Drive folder](https://drive.google.com/drive/folders/184vJEGNb4RQ5tb9fF1LaFxy98oRriyPi?usp=drive_link).
 
-## Setup
+Demo recordings and results: [Google Drive folder](https://drive.google.com/drive/folders/184vJEGNb4RQ5tb9fF1LaFxy98oRriyPi?usp=drive_link).
 
-### Git Submodules
-After cloning this repository, initialize and update the submodules:
-```bash
-# If you haven't cloned the repository yet:
-git clone --recursive [repository-url]
+## History
 
-# If you've already cloned the repository:
-git submodule update --init --recursive
-
-# To update submodules to their latest version:
-git submodule update --remote
-```
-
-For the full environment setup (uv, dependencies, VGGT), follow [DEMO.md](DEMO.md).
-
-## Visualization of Point Clouds
-
-Interactive 3D visualization of 3D search results and featurized point clouds using the Rerun SDK.
-
-### Environment Setup
-
-#### Using uv
-```bash
-# Create and activate the virtual environment
-uv venv .rerun_env --python 3.11
-source .rerun_env/bin/activate
-
-# Install required packages
-uv pip install -r environments/rerun_requirements.txt
-```
-
----
-
-### Usage
-
-#### **Interactive Text Search Visualization (Hydra-based)**
-
-The main entry point for interactive semantic search on featurized point clouds is:
-
-```bash
-python rerun/run_interactive.py pointcloud_dir=<path/to/featurized/pt/files> file_type=<file_key>
-```
-
-- `pointcloud_dir`: Directory containing featurized `.pt` files (REQUIRED).
-- `file_type`: Key or filename (without extension) of the `.pt` file to load (REQUIRED, e.g., `42447230`).
-- You can override any config option via CLI, e.g.:
-  - `rendering.create_mesh=true`
-  - `interactive_search.outlier_method=iqr`
-  - `interactive_search.use_dino_filtering=false`
-  - `server.port=9878`
-  - `server.mode=remote`
-- The default config is in `rerun/config/base_config.yaml`. See that file for all options.
-
-**Example:**
-```bash
-python rerun/run_interactive.py pointcloud_dir=../data/output/arkit_scenes/raw/featurized/ file_type=42447230
-```
-
-**Remote Mode & Port Forwarding:**
-
-If you are running the script in `remote` server mode, you need to connect to the gRPC server from your local machine:
-
-1. **Establish SSH port forwarding:**
-   ```bash
-   ssh -L {port}:localhost:{port} {user}@{server-ip}
-   ```
-   Replace `{port}` with the port number (e.g., 9878), `{user}` with your username, and `{server-ip}` with the server address.
-
-2. **Connect to the gRPC server locally:**
-   After starting the script in remote mode and establishing port forwarding, run:
-   ```bash
-   rerun --connect localhost:{port}/proxy
-   ```
-   This will connect your local Rerun viewer to the remote gRPC server via the forwarded port.
-
-**Controls (in the terminal window):**
-- Type search queries and press Enter (e.g., `chair`, `red sofa`)
-- Type `clear` to remove highlights
-- Type `q` to quit
-- Type `help` for more commands and options (e.g., change outlier method, enable/disable DINO filtering, set thresholds)
-
-**Advanced CLI overrides:**
-```bash
-python rerun/run_interactive.py pointcloud_dir=... file_type=... interactive_search.outlier_method=percentile rendering.create_mesh=true
-```
-
-#### **Script Options (Hydra config keys):**
-
-| Option                                 | Description                                               | Default (base_config.yaml)         |
-|-----------------------------------------|-----------------------------------------------------------|------------------------------------|
-| `pointcloud_dir`                        | Path to featurized pointcloud `.pt` files                 | `../data/output/arkit_scenes/raw/featurized/` |
-| `file_type`                             | Key/filename (no extension) of `.pt` file to load         | `"42447230"`                      |
-| `original_pointcloud`                   | Path to original PLY pointcloud for reference             | `../data/output/arkit_scenes/raw/Training` |
-| `rendering.create_mesh`                 | Whether to create and display a mesh                      | `false`                           |
-| `interactive_search.outlier_method`     | Outlier detection method (`adaptive`, `iqr`, `percentile`, `z_score`, `combined`) | `"adaptive"`                      |
-| `interactive_search.use_statistical_outliers` | Use statistical outlier detection                        | `true`                            |
-| `interactive_search.use_dino_filtering` | Use DINO features for structural filtering                | `true`                            |
-| `server.port`                           | Port for Rerun viewer or gRPC server                      | `9878`                            |
-| `server.mode`                           | `local` (spawn viewer) or `remote` (gRPC server)          | `remote`                          |
-
-**To see all config options and their defaults, check `rerun/config/base_config.yaml`.**
-
----
-
-#### **Legacy/Direct Script Usage**
-
-You can also run the visualization directly (bypassing Hydra/config):
-
-```bash
-python rerun/src/visualize_interactive_text_search.py <path/to/featurized/pt/files> --file-type <file_key>
-```
-But **using `run_interactive.py` with Hydra is recommended** for full config flexibility.
-
----
-
-#### **MASt3R-SLAM Results Visualization**
-
-For visualizing raw SLAM outputs (PLY, trajectory, keyframes, depth maps):
-
-```bash
-python rerun/scripts/visualize_mast3r_pointcloud.py <slam_dir> [--mode serve|save] [--remote-host <ip>] [--remote-port <port>]
-```
-
----
-
-### Features
-
-- **Interactive text search** on featurized point clouds (CLIP/DINO)
-- **Automatic file discovery** from SLAM/featurized output directories
-- **3D visualization** of point clouds, camera trajectory, keyframes, depth maps
-- **Remote streaming** and local viewer support
-- **Configurable outlier detection and filtering** (see terminal `help`)
+Earlier iterations used [Rerun](https://rerun.io/) for visualization and MASt3R-SLAM / ARKit VIO as reconstruction sources — see git history (`rerun/` before this branch) and the `eval` branch for benchmark scripts.

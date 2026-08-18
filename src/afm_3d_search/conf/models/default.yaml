@@ -1,8 +1,13 @@
 # conf/models/default.yaml
 
+recon:
+  backbone: "vggt_omega"   # "vggt_omega" | "vggt"
+  image_resolution: 512    # vggt_omega preprocessing resolution
 clip:
-  version: "ViT-L/14"
+  # image-text encoder: SigLIP2 (default) or OpenAI CLIP (e.g. "ViT-L/14")
+  version: "google/siglip2-so400m-patch14-384"
 sam:
   checkpoint: "sam_vit_h_4b8939.pth"
+  crop_n_layers: 0   # 1 = extra AMG pass for small objects (~3x SAM time)
 dino:
   version: "dinov2_vits14"

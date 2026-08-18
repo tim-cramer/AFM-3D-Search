@@ -1,0 +1,446 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AFM 3D Search</title>
+<style>
+  :root {
+    --bg: #0b0e14;
+    --panel: rgba(17, 22, 32, 0.82);
+    --border: rgba(255, 255, 255, 0.09);
+    --text: #e8ecf3;
+    --muted: #8b94a7;
+    --accent: #5eb1ff;
+    --hit: #ffb454;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; overflow: hidden; background: var(--bg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: var(--text); }
+  #canvas-wrap { position: fixed; inset: 0; }
+  canvas { display: block; }
+
+  #panel {
+    position: fixed; top: 16px; left: 16px; width: 320px; max-height: calc(100vh - 32px);
+    overflow-y: auto; background: var(--panel); backdrop-filter: blur(14px);
+    -webkit-backdrop-filter: blur(14px); border: 1px solid var(--border);
+    border-radius: 14px; padding: 18px; z-index: 10;
+  }
+  h1 { font-size: 17px; font-weight: 650; letter-spacing: 0.2px; }
+  h1 span { color: var(--accent); }
+  #scene-select {
+    width: 100%; margin-top: 10px; padding: 8px 10px; font-size: 13px; color: var(--text);
+    background: rgba(255,255,255,0.06); border: 1px solid var(--border); border-radius: 8px;
+    outline: none; cursor: pointer;
+  }
+  #scene-select:focus { border-color: var(--accent); }
+  #scene-select option { background: #141a26; }
+  #scene-info { font-size: 12px; color: var(--muted); margin: 8px 0 14px; line-height: 1.5; }
+
+  #search-row { display: flex; gap: 8px; }
+  #query {
+    flex: 1; padding: 10px 12px; font-size: 14px; color: var(--text);
+    background: rgba(255,255,255,0.06); border: 1px solid var(--border);
+    border-radius: 9px; outline: none; transition: border-color .15s;
+  }
+  #query:focus { border-color: var(--accent); }
+  #query::placeholder { color: var(--muted); }
+  #go {
+    padding: 10px 14px; font-size: 14px; font-weight: 600; color: #0b0e14;
+    background: var(--accent); border: none; border-radius: 9px; cursor: pointer;
+  }
+  #go:disabled { opacity: 0.5; cursor: default; }
+
+  #status { font-size: 12.5px; color: var(--muted); margin-top: 10px; min-height: 18px; line-height: 1.5; }
+  #status b { color: var(--hit); font-weight: 600; }
+  #status.error { color: #ff7a7a; }
+
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }
+  .chip {
+    font-size: 12px; padding: 5px 10px; border-radius: 999px; cursor: pointer;
+    background: rgba(255,255,255,0.06); border: 1px solid var(--border); color: var(--text);
+    transition: background .15s;
+  }
+  .chip:hover { background: rgba(94,177,255,0.18); }
+  .chip.active { background: rgba(94,177,255,0.25); border-color: var(--accent); }
+
+  details { margin-top: 16px; }
+  summary { font-size: 12.5px; color: var(--muted); cursor: pointer; user-select: none; }
+  .num-row { display: flex; justify-content: space-between; align-items: center;
+    margin-top: 12px; font-size: 12.5px; color: var(--muted); }
+  .num-row input[type=number] {
+    width: 76px; padding: 6px 8px; font-size: 13px; text-align: right; color: var(--text);
+    background: rgba(255,255,255,0.06); border: 1px solid var(--border); border-radius: 7px; outline: none;
+  }
+  .num-row input[type=number]:focus { border-color: var(--accent); }
+  .num-row .unit { margin-left: 6px; }
+  .ctl-check { display: flex; align-items: center; gap: 8px; margin-top: 12px; font-size: 12.5px; color: var(--muted); }
+  .ctl-check input { accent-color: var(--accent); }
+
+  #clear-btn {
+    margin-top: 14px; width: 100%; padding: 8px; font-size: 13px; color: var(--muted);
+    background: transparent; border: 1px solid var(--border); border-radius: 9px; cursor: pointer;
+  }
+  #clear-btn:hover { color: var(--text); border-color: var(--muted); }
+
+  #hint {
+    position: fixed; bottom: 14px; right: 16px; font-size: 11.5px; color: var(--muted);
+    background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+    padding: 6px 10px; z-index: 10;
+  }
+  #loading {
+    position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+    flex-direction: column; gap: 12px; background: var(--bg); z-index: 20;
+    font-size: 14px; color: var(--muted); transition: opacity .4s;
+  }
+  .spinner {
+    width: 28px; height: 28px; border-radius: 50%; border: 3px solid rgba(255,255,255,0.12);
+    border-top-color: var(--accent); animation: spin 0.9s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "/static/vendor/three.module.min.js",
+    "three/addons/controls/ArcballControls.js": "/static/vendor/ArcballControls.js"
+  }
+}
+</script>
+</head>
+<body>
+<div id="canvas-wrap"></div>
+
+<div id="panel">
+  <h1>AFM <span>3D Search</span></h1>
+  <select id="scene-select"></select>
+  <div id="scene-info">loading scene…</div>
+
+  <div id="search-row">
+    <input id="query" type="text" placeholder='try "backpack" …' autocomplete="off" spellcheck="false">
+    <button id="go">Search</button>
+  </div>
+  <div id="status"></div>
+
+  <div class="chips" id="suggestions"></div>
+
+  <details open>
+    <summary>Settings</summary>
+    <div class="num-row">
+      <label for="pct">Highlight top</label>
+      <span><input id="pct" type="number" min="0.05" max="50" step="0.05" value="1"><span class="unit">%</span></span>
+    </div>
+    <div class="num-row">
+      <label for="size">Point size</label>
+      <span><input id="size" type="number" min="0.1" max="6" step="0.1" value="1"><span class="unit">×</span></span>
+    </div>
+    <div class="ctl-check">
+      <input id="greyout" type="checkbox" checked>
+      <label for="greyout">Grey out unmatched points</label>
+    </div>
+    <div class="ctl-check">
+      <input id="coverage" type="checkbox" checked>
+      <label for="coverage">Coverage filter (A/B)</label>
+    </div>
+    <div class="ctl-check">
+      <input id="contrast" type="checkbox" checked>
+      <label for="contrast">Contrast vs. background labels</label>
+    </div>
+    <div class="ctl-check">
+      <input id="dinosmooth" type="checkbox">
+      <label for="dinosmooth">DINO smoothing</label>
+    </div>
+    <div class="ctl-check">
+      <input id="flip" type="checkbox">
+      <label for="flip">Flip scene (180°)</label>
+    </div>
+  </details>
+
+  <button id="clear-btn">Clear highlights</button>
+</div>
+
+<div id="hint">drag&nbsp;·&nbsp;rotate &nbsp;|&nbsp; ring&nbsp;·&nbsp;axis rotate &nbsp;|&nbsp; scroll&nbsp;·&nbsp;zoom &nbsp;|&nbsp; right-drag&nbsp;·&nbsp;pan</div>
+<div id="loading"><div class="spinner"></div><div id="loading-text">loading point cloud…</div></div>
+
+<script type="module">
+import * as THREE from 'three';
+import { ArcballControls } from 'three/addons/controls/ArcballControls.js';
+
+const $ = id => document.getElementById(id);
+
+// ---------------------------------------------------------------- scene setup
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+$('canvas-wrap').appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0b0e14);
+const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.01, 500);
+// MeshLab-style arcball: three draggable axis rings + free rotation between them
+const controls = new ArcballControls(camera, renderer.domElement, scene);
+controls.setGizmosVisible(true);
+controls.enableAnimations = true;
+controls.radiusFactor = 0.75;
+
+const group = new THREE.Group();   // holds both clouds; rotated for z-up data
+scene.add(group);
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+// Corner axes indicator (red X, green Y, blue Z)
+const gizmoScene = new THREE.Scene();
+gizmoScene.add(new THREE.AxesHelper(1.1));
+const gizmoCam = new THREE.PerspectiveCamera(45, 1, 0.1, 10);
+const gizmoDir = new THREE.Vector3();
+
+renderer.autoClear = false;
+(function animate() {
+  requestAnimationFrame(animate);
+  renderer.setViewport(0, 0, innerWidth, innerHeight);
+  renderer.setScissorTest(false);
+  renderer.clear();
+  renderer.render(scene, camera);
+
+  const s = Math.round(Math.min(innerWidth, innerHeight) * 0.14);
+  renderer.clearDepth();
+  renderer.setViewport(innerWidth - s - 10, 10, s, s);
+  renderer.setScissor(innerWidth - s - 10, 10, s, s);
+  renderer.setScissorTest(true);
+  gizmoDir.copy(camera.position).sub(controls.target).normalize();
+  gizmoCam.position.copy(gizmoDir).multiplyScalar(3.2);
+  gizmoCam.up.copy(camera.up);
+  gizmoCam.lookAt(0, 0, 0);
+  renderer.render(gizmoScene, gizmoCam);
+})();
+
+// ---------------------------------------------------------------- state
+let N = 0;
+let positions, baseColors, greyColors;   // Float32Array / Uint8Array views
+let basePoints, highlightPoints;
+let baseSize = 0.01;
+let lastQuery = null, lastSims = null, lastThreshold = 0;
+
+// ---------------------------------------------------------------- load cloud
+function showLoading(text) {
+  $('loading-text').textContent = text;
+  $('loading').style.display = 'flex';
+  $('loading').style.opacity = 1;
+}
+function hideLoading() {
+  $('loading').style.opacity = 0;
+  setTimeout(() => { $('loading').style.display = 'none'; }, 450);
+}
+
+async function loadCloud() {
+  showLoading('loading scene…');
+  clearHighlights();
+  if (basePoints) { group.remove(basePoints); basePoints.geometry.dispose(); basePoints = null; }
+
+  const meta = await (await fetch('/api/meta')).json();
+  const sel = $('scene-select');
+  sel.innerHTML = '';
+  for (const name of meta.scenes || [meta.scene]) {
+    const o = document.createElement('option');
+    o.value = o.textContent = name;
+    sel.appendChild(o);
+  }
+  sel.value = meta.scene;
+  $('scene-info').innerHTML =
+    `${meta.num_points.toLocaleString()} points · ` +
+    `${meta.clip_model} · DINO ${meta.has_dino ? 'yes' : 'no'}`;
+
+  $('suggestions').innerHTML = '';
+  for (const s of meta.suggestions || []) {
+    const c = document.createElement('span');
+    c.className = 'chip';
+    c.textContent = s;
+    c.onclick = () => { $('query').value = s; runSearch(); };
+    $('suggestions').appendChild(c);
+  }
+
+  $('loading-text').textContent = `loading ${meta.num_points.toLocaleString()} points…`;
+  const buf = await (await fetch('/api/pointcloud')).arrayBuffer();
+  N = new DataView(buf).getUint32(0, true);
+  positions = new Float32Array(buf, 4, N * 3);
+  baseColors = new Uint8Array(buf, 4 + N * 12, N * 3);
+
+  greyColors = new Uint8Array(N * 3);
+  for (let i = 0; i < N; i++) {
+    const l = 0.299 * baseColors[3*i] + 0.587 * baseColors[3*i+1] + 0.114 * baseColors[3*i+2];
+    const v = l * 0.35;
+    greyColors[3*i] = greyColors[3*i+1] = greyColors[3*i+2] = v;
+  }
+
+  // Robust framing: percentile bounds so stray far-away outlier points
+  // (common in feed-forward recon output) don't blow up center and scale
+  const stride = Math.max(1, Math.floor(N / 60000));
+  const sx = [], sy = [], sz = [];
+  for (let i = 0; i < N; i += stride) { sx.push(positions[3*i]); sy.push(positions[3*i+1]); sz.push(positions[3*i+2]); }
+  const bounds = arr => { arr.sort((a, b) => a - b);
+    return [arr[Math.floor(arr.length * 0.02)], arr[Math.ceil(arr.length * 0.98) - 1]]; };
+  const [x0, x1] = bounds(sx), [y0, y1] = bounds(sy), [z0, z1] = bounds(sz);
+  const center = new THREE.Vector3((x0 + x1) / 2, (y0 + y1) / 2, (z0 + z1) / 2);
+  const diag = Math.hypot(x1 - x0, y1 - y0, z1 - z0);
+  baseSize = diag * 0.0028;
+  camera.near = diag * 0.002;
+  camera.far = diag * 200;
+  camera.updateProjectionMatrix();
+  controls.maxDistance = diag * 12;
+
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  geo.setAttribute('color', new THREE.BufferAttribute(baseColors.slice(), 3, true));
+  const mat = new THREE.PointsMaterial({ size: baseSize, vertexColors: true, sizeAttenuation: true });
+  basePoints = new THREE.Points(geo, mat);
+  basePoints.position.copy(center.clone().negate());
+  group.add(basePoints);
+
+  camera.position.set(diag * 0.55, diag * 0.45, diag * 0.75);
+  controls.target.set(0, 0, 0);
+  controls.update();
+
+  hideLoading();
+  $('query').focus();
+}
+
+$('scene-select').onchange = async () => {
+  const name = $('scene-select').value;
+  showLoading(`switching to ${name}… (first load builds the search index)`);
+  try {
+    const res = await fetch('/api/scene', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name }),
+    });
+    if (!res.ok) throw new Error((await res.json()).error || res.statusText);
+    await loadCloud();
+  } catch (e) {
+    $('loading-text').textContent = 'scene switch failed: ' + e.message;
+  }
+};
+
+// ---------------------------------------------------------------- search
+function heatColor(t) { // 0 → amber, 1 → hot red
+  return [255, Math.round(190 - 130 * t), Math.round(70 * (1 - t))];
+}
+
+async function runSearch() {
+  const query = $('query').value.trim();
+  if (!query) return;
+  if (query.toLowerCase() === 'clear') { clearHighlights(); $('query').value = ''; return; }
+
+  $('go').disabled = true;
+  $('status').className = '';
+  $('status').textContent = 'encoding query…';
+  try {
+    const topPct = Math.min(Math.max(parseFloat($('pct').value) || 1, 0.02), 50);
+    const percentile = 100 - topPct;
+    const res = await fetch('/api/search', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query, percentile, coverage: $('coverage').checked,
+        contrastive: $('contrast').checked, smooth: $('dinosmooth').checked }),
+    });
+    if (!res.ok) throw new Error((await res.json()).error || res.statusText);
+
+    lastSims = new Float32Array(await res.arrayBuffer());
+    lastThreshold = parseFloat(res.headers.get('X-Threshold'));
+    lastQuery = query;
+    const matches = parseInt(res.headers.get('X-Matches'));
+    const simMax = parseFloat(res.headers.get('X-Sim-Max'));
+
+    applyHighlights();
+    $('status').innerHTML =
+      `<b>${matches.toLocaleString()}</b> points match “${query}” · ` +
+      `sim ≥ ${lastThreshold.toFixed(3)} · max ${simMax.toFixed(3)}`;
+    markActiveChip(query);
+  } catch (e) {
+    $('status').className = 'error';
+    $('status').textContent = 'search failed: ' + e.message;
+  } finally {
+    $('go').disabled = false;
+  }
+}
+
+function applyHighlights() {
+  if (!lastSims) return;
+  const colorAttr = basePoints.geometry.getAttribute('color');
+  colorAttr.array.set($('greyout').checked ? greyColors : baseColors);
+  colorAttr.needsUpdate = true;
+
+  // build highlight subset
+  const idx = [];
+  let simMax = -Infinity;
+  for (let i = 0; i < N; i++) if (lastSims[i] >= lastThreshold) {
+    idx.push(i);
+    if (lastSims[i] > simMax) simMax = lastSims[i];
+  }
+  const hp = new Float32Array(idx.length * 3);
+  const hc = new Uint8Array(idx.length * 3);
+  const range = Math.max(simMax - lastThreshold, 1e-6);
+  for (let j = 0; j < idx.length; j++) {
+    const i = idx[j];
+    hp[3*j] = positions[3*i]; hp[3*j+1] = positions[3*i+1]; hp[3*j+2] = positions[3*i+2];
+    const [r, g, b] = heatColor(Math.min((lastSims[i] - lastThreshold) / range, 1));
+    hc[3*j] = r; hc[3*j+1] = g; hc[3*j+2] = b;
+  }
+
+  if (highlightPoints) { group.remove(highlightPoints); highlightPoints.geometry.dispose(); }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(hp, 3));
+  geo.setAttribute('color', new THREE.BufferAttribute(hc, 3, true));
+  const mat = new THREE.PointsMaterial({
+    size: baseSize * 2.2 * pointSizeFactor(),
+    vertexColors: true, sizeAttenuation: true,
+  });
+  highlightPoints = new THREE.Points(geo, mat);
+  highlightPoints.position.copy(basePoints.position);
+  group.add(highlightPoints);
+}
+
+function clearHighlights() {
+  lastQuery = lastSims = null;
+  if (highlightPoints) { group.remove(highlightPoints); highlightPoints.geometry.dispose(); highlightPoints = null; }
+  if (basePoints) {
+    const colorAttr = basePoints.geometry.getAttribute('color');
+    colorAttr.array.set(baseColors);
+    colorAttr.needsUpdate = true;
+  }
+  $('status').textContent = '';
+  markActiveChip(null);
+}
+
+function markActiveChip(query) {
+  for (const c of document.querySelectorAll('.chip'))
+    c.classList.toggle('active', c.textContent === query);
+}
+
+// ---------------------------------------------------------------- ui wiring
+$('go').onclick = runSearch;
+$('query').addEventListener('keydown', e => { if (e.key === 'Enter') runSearch(); });
+$('clear-btn').onclick = clearHighlights;
+
+function pointSizeFactor() {
+  return Math.min(Math.max(parseFloat($('size').value) || 1, 0.1), 6);
+}
+$('size').oninput = () => {
+  const k = pointSizeFactor();
+  if (basePoints) basePoints.material.size = baseSize * k;
+  if (highlightPoints) highlightPoints.material.size = baseSize * 2.2 * k;
+};
+$('greyout').onchange = () => { if (lastSims) applyHighlights(); else clearHighlights(); };
+// contrast / dinosmooth / pct are read on the next explicit Search click — no auto-rerun
+$('flip').onchange = () => { group.rotation.x = $('flip').checked ? Math.PI : 0; };
+$('size').oninput();
+
+loadCloud().catch(e => {
+  $('loading-text').textContent = 'failed to load: ' + e.message;
+});
+</script>
+</body>
+</html>
