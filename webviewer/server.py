@@ -155,7 +155,17 @@ class TextEncoder:
 # --------------------------------------------------------------------------- #
 # Search index: contrastive negatives + DINO-weighted kNN smoothing
 # --------------------------------------------------------------------------- #
-NEGATIVE_PROMPTS = ["object", "things", "stuff", "texture"]
+# Competing labels for query-time contrast. These are deliberately CONCRETE
+# ("a wall", "the floor") rather than the generic LERF canonical negatives
+# ("object", "things", "stuff"): generic negatives sit at cosine 0.83-0.85 to
+# any query and subtract the signal itself, while concrete competitors describe
+# what the distractor points actually are. Measured on bude, softmax over these
+# raises top-k separation 3-8x and cuts fragmentation (monitor 167 -> 19).
+BACKGROUND_PROMPTS = [
+    "a wall", "the floor", "the ceiling", "a door", "a window",
+    "a piece of furniture", "a textured surface", "clutter", "the corner of a room",
+]
+CONTRAST_TEMPERATURE = 20.0
 
 
 class SearchIndex:
@@ -167,8 +177,9 @@ class SearchIndex:
     """
 
     def __init__(self, scene, encoder, cache_path: Path = None):
-        self.negatives = np.stack([encoder.encode(p) for p in NEGATIVE_PROMPTS])
-        self.temperature = encoder.temperature
+        print("Scoring background vocabulary...")
+        bg = np.stack([encoder.encode(p) for p in BACKGROUND_PROMPTS])
+        self.bg_logits = (scene["clip"] @ bg.T) * CONTRAST_TEMPERATURE  # (N, len(BG))
         # Voxels no SAM mask ever covered carry the pipeline's 0.5x global-image
         # fallback: a frame-average embedding that contains whatever is prominent
         # in the scene, so it outranks real object voxels (measured: 95% of the
@@ -228,14 +239,17 @@ class SearchIndex:
             print(f"kNN graph cached to {cache_path.name}")
         print(f"Search index ready ({n} points, k=8)")
 
-    def relevancy(self, sims_query, clip_feats):
-        """Pairwise softmax vs each negative prompt, take the minimum (LERF)."""
-        result = None
-        for neg in self.negatives:
-            sims_neg = clip_feats @ neg
-            p = 1.0 / (1.0 + np.exp(np.clip((sims_neg - sims_query) * self.temperature, -50, 50)))
-            result = p if result is None else np.minimum(result, p)
-        return result
+    def relevancy(self, sims_query):
+        """Softmax of the query against concrete competing labels.
+
+        Normalizing per point against its own competitors removes the shared
+        component that makes every feature ~0.8 similar to every other, without
+        needing any prior knowledge of what the scene contains.
+        """
+        logits = np.concatenate([(sims_query * CONTRAST_TEMPERATURE)[:, None], self.bg_logits], axis=1)
+        logits -= logits.max(axis=1, keepdims=True)
+        np.exp(logits, out=logits)
+        return logits[:, 0] / logits.sum(axis=1)
 
     def smooth(self, scores):
         if self.nbr_idx is None:
@@ -382,9 +396,7 @@ class Handler(BaseHTTPRequestHandler):
 
         query = (req.get("query") or "").strip()
         percentile = float(req.get("percentile", 99.0))
-        # both default off: with sharp SigLIP features + mask-exact crops the raw
-        # similarities are already well separated; these help mushy features only
-        contrastive = bool(req.get("contrastive", False))
+        contrastive = bool(req.get("contrastive", True))
         smoothing = bool(req.get("smooth", False))
         use_coverage = bool(req.get("coverage", True))
         if not query:
@@ -395,7 +407,7 @@ class Handler(BaseHTTPRequestHandler):
         text_feat = encoder.encode(query)
         sims = scene["clip"] @ text_feat
 
-        scores = index.relevancy(sims, scene["clip"]) if contrastive else sims
+        scores = index.relevancy(sims) if contrastive else sims
         if smoothing:
             scores = index.smooth(scores)
 
